@@ -1000,14 +1000,34 @@ def bisinusoidal_func(theta, A1, phi1, C):
     return A1 * np.cos(2 * theta + phi1) +  C
 
 def analyze_frame(frame, square_size=256, overlap=0.5, strength=0.75, kl_cutoff_inf=0.01, 
-                  kl_cutoff_sup=0.1, wavenumber_step=0.01, log=True, plot_condition=False):
+                  kl_cutoff_sup=0.1, wavenumber_step=0.01, c_cutoff_inf=0, c_cutoff_sup=500, Filter=True, log=True, plot_condition=False):
     
     data_shape = frame.shape
     all_directions = []
     all_amplitudes = []
 
+
     step_size = int(square_size * (1 - overlap))
     wavenumber_values = np.arange(kl_cutoff_inf, kl_cutoff_sup, wavenumber_step)
+
+    k = fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
+    l = fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
+    k, l = np.meshgrid(k, l)
+    k = k / data_shape[1]
+    l = l / data_shape[0]
+
+    radius = np.sqrt(k**2 + l**2)
+    theta = np.arctan2(l, k)
+
+    f = np.fft.fftfreq(data_shape[0])
+    f = np.fft.fftshift(f)
+
+    radius[radius == 0] = np.inf
+    c = np.abs(f[:, np.newaxis, np.newaxis]) / radius
+    c = c[0, :, :]
+    radius[radius == np.inf] = 0
+
+    filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (radius >= kl_cutoff_inf) & (radius <= kl_cutoff_sup) 
 
     for i in range(0, data_shape[0] - square_size + 1, step_size):
         for j in range(0, data_shape[1] - square_size + 1, step_size):
@@ -1030,18 +1050,12 @@ def analyze_frame(frame, square_size=256, overlap=0.5, strength=0.75, kl_cutoff_
 
             # Perform FFT on the entire frame
             fft_data = fftn(blurred_frame)
-            fft_data = fftshift(fft_data)
+            fft_data = fftshift(fft_data) 
 
-            # Calculate kl unitlessly for each pixel
-            k = fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
-            l = fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
-            k, l = np.meshgrid(k, l)
+            # Apply the mask to the FFT data
+            if Filter:
+                fft_data[~filter_mask] = 0
 
-            k = k / data_shape[1]
-            l = l / data_shape[0]
-
-            radius = np.sqrt(k**2 + l**2)
-            theta = np.arctan2(l, k)
             amplitude = np.abs(fft_data)
 
             directions = []
@@ -1106,7 +1120,11 @@ def analyze_frame(frame, square_size=256, overlap=0.5, strength=0.75, kl_cutoff_
 
     return all_directions, all_amplitudes, wavenumber_values
 
-def visualize_results(frame, all_directions, all_amplitudes, wavenumber_values, square_number, square_size=256, overlap=0.5, strength=0.75, log=True):
+def visualize_results(frame, all_directions, all_amplitudes, wavenumber_values, 
+                      square_number, square_size=256, overlap=0.5, strength=0.75,
+                       kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, 
+                       c_cutoff_sup=500, Filter=True, log=True):
+    
     data_shape = frame.shape
     step_size = int(square_size * (1 - overlap))
     num_squares_per_row = (data_shape[1] - square_size) // step_size + 1
@@ -1130,6 +1148,41 @@ def visualize_results(frame, all_directions, all_amplitudes, wavenumber_values, 
 
     # Apply the mask to the frame
     blurred_frame = frame * mask
+
+    # Perform FFT on the entire frame
+    fft_data = fftn(blurred_frame)
+    fft_data = fftshift(fft_data)
+
+    # Calculate kl unitlessly for each pixel
+    k = fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
+    l = fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
+    k, l = np.meshgrid(k, l)
+
+    k = k / data_shape[1]
+    l = l / data_shape[0]
+
+    radius = np.sqrt(k**2 + l**2)
+    theta = np.arctan2(l, k)
+
+    # Frequency components as unitless (normalized index positions)
+    f = np.fft.fftfreq(data_shape[0])
+    f = np.fft.fftshift(f)
+
+    # Calculate unitless phase speed
+    radius[radius == 0] = np.inf  # Avoid division by zero
+    c = np.abs(f[:, np.newaxis, np.newaxis]) / radius  # c is unitless
+    c = c[0, :, :]  # Take the first frame only
+    radius[radius == np.inf] = 0
+
+    filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (radius >= kl_cutoff_inf) & (radius <= kl_cutoff_sup) 
+
+    # Apply the mask to the FFT data
+    if Filter:
+        fft_data[~filter_mask] = 0
+
+    fft_data = np.fft.ifftshift(fft_data)
+    fft_data = np.fft.ifftn(fft_data)
+    blurred_frame = np.real(fft_data)
 
     # Plot the blurred frame and the corresponding rose plot
     fig, axs = plt.subplots(1, 2, figsize=(12, 6))
