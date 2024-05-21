@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib import colormaps
 from scipy.linalg import eigh
 from eofs.standard import Eof
-from scipy.fft import fft2, fftshift
+from scipy.fft import fftn, fft2, fftshift
 from scipy.optimize import curve_fit
 
 from PIL import Image
@@ -996,4 +996,174 @@ def Show_Power_Spectrum(frames,index=0,theta_coeff=0,spat_angle_cutoff_inf= -np.
         plt.imshow(frame_tilted[index,:,:], cmap='gray')
         plt.title('Tilted Image')
 
+def bisinusoidal_func(theta, A1, phi1, C):
+    return A1 * np.cos(2 * theta + phi1) +  C
+
+def analyze_frame(frame, square_size=256, overlap=0.5, strength=0.75, kl_cutoff_inf=0.01, 
+                  kl_cutoff_sup=0.1, wavenumber_step=0.01, log=True, plot_condition=False):
+    
+    data_shape = frame.shape
+    all_directions = []
+    all_amplitudes = []
+
+    step_size = int(square_size * (1 - overlap))
+    wavenumber_values = np.arange(kl_cutoff_inf, kl_cutoff_sup, wavenumber_step)
+
+    for i in range(0, data_shape[0] - square_size + 1, step_size):
+        for j in range(0, data_shape[1] - square_size + 1, step_size):
+            # Create a mask for the entire frame
+            mask = np.zeros(data_shape)
+
+            # Create a 2D radial gradient mask for the area outside the square
+            y, x = np.ogrid[:data_shape[0], :data_shape[1]]
+            center_y, center_x = i + square_size // 2, j + square_size // 2
+            distance_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+            max_distance = strength * np.sqrt((data_shape[0] / 2)**2 + (data_shape[1] / 2)**2)
+            gradient_mask = 1 - np.clip(distance_from_center / max_distance, 0, 1)
+
+            # Apply the gradient mask to the area outside the central square
+            mask[i:i+square_size, j:j+square_size] = 1
+            mask = np.maximum(mask, gradient_mask)
+
+            # Apply the mask to the frame
+            blurred_frame = frame * mask
+
+            # Perform FFT on the entire frame
+            fft_data = fftn(blurred_frame)
+            fft_data = fftshift(fft_data)
+
+            # Calculate kl unitlessly for each pixel
+            k = fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
+            l = fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
+            k, l = np.meshgrid(k, l)
+
+            k = k / data_shape[1]
+            l = l / data_shape[0]
+
+            radius = np.sqrt(k**2 + l**2)
+            theta = np.arctan2(l, k)
+            amplitude = np.abs(fft_data)
+
+            directions = []
+            amplitudes = []
+
+            for wavenumber in wavenumber_values:
+                mask = (radius > (wavenumber - wavenumber_step/2)) & (radius < (wavenumber + wavenumber_step/2))
+                if np.any(mask):
+                    extracted_data = amplitude[mask]
+                    theta_flat = theta[mask]
+                    
+                    # Create theta bins
+                    num_bins = 36  # 10 degrees each bin
+                    theta_bins = np.linspace(np.min(theta_flat), np.max(theta_flat), num_bins + 1)
+                    mean_amplitude = np.zeros(num_bins)
+
+                    for k in range(num_bins):
+                        in_bin = (theta_flat >= theta_bins[k]) & (theta_flat < (theta_bins[k + 1] if k < num_bins - 1 else theta_bins[k]))
+                        bin_data = extracted_data[in_bin]
+                        if len(bin_data) > 0:
+                            mean_amplitude[k] = np.mean(bin_data)
+                        else:
+                            mean_amplitude[k] = 0  # or another default value
+
+                    # Perform bisinusoidal fitting
+                    initial_guess = [np.max(mean_amplitude), 0, np.mean(mean_amplitude)]
+                    popt, _ = curve_fit(bisinusoidal_func, theta_bins[:-1], mean_amplitude, p0=initial_guess)
+
+                    # Calculate direction and amplitude based on the fit
+                    theta_fit = theta_bins[:-1]
+                    fitted_amplitude = bisinusoidal_func(theta_fit, *popt)
+                    max_indices = np.argsort(fitted_amplitude)[-2:]  # Indices of the two largest values
+
+                    direction_1 = theta_fit[max_indices[0]] * 180 / np.pi   # X value for the first maximum Y in degrees
+                    amplitude_1 = np.max([fitted_amplitude[max_indices[0]],fitted_amplitude[max_indices[1]]])  # First maximum Y value
+
+                    direction_2 = theta_fit[max_indices[1]] * 180 / np.pi   # X value for the second maximum Y in degrees
+
+                    # Plot the amplitude vs. angle and the fit if Plot is True
+                    if plot_condition:
+                        plt.figure(figsize=(10, 6))
+                        plt.plot(theta_bins[:-1] * 180 / np.pi, mean_amplitude, label='Mean Amplitude')
+                        plt.plot(theta_bins[:-1] * 180 / np.pi, bisinusoidal_func(theta_bins[:-1], *popt), 'r-', label='Bisinusoidal Fit')
+                        plt.title(f'Amplitude vs. Angle for Wavenumber {wavenumber}')
+                        plt.xlabel('Angle (degrees)')
+                        plt.ylabel('Amplitude')
+                        plt.legend()
+                        plt.grid(True)
+                        plt.show()
+                        print(f'Fitted parameters for wavenumber {wavenumber}: A1 = {popt[0]}, phi1 = {popt[1]}, C = {popt[2]}')
+
+                    # Print the calculated directions and amplitudes
+                    # print(f'Calculated directions: {direction_1} degrees, {direction_2} degrees')
+                    # print(f'Calculated amplitude: {amplitude_1}')
+
+                    # Store direction and amplitude data
+                    directions.append((direction_1, direction_2))
+                    amplitudes.append(amplitude_1)
+
+            all_directions.append(directions)
+            all_amplitudes.append(amplitudes)
+
+    return all_directions, all_amplitudes, wavenumber_values
+
+def visualize_results(frame, all_directions, all_amplitudes, wavenumber_values, square_number, square_size=256, overlap=0.5, strength=0.75, log=True):
+    data_shape = frame.shape
+    step_size = int(square_size * (1 - overlap))
+    num_squares_per_row = (data_shape[1] - square_size) // step_size + 1
+    
+    i = (square_number // num_squares_per_row) * step_size
+    j = (square_number % num_squares_per_row) * step_size
+
+    # Create a mask for the entire frame
+    mask = np.zeros(data_shape)
+
+    # Create a 2D radial gradient mask for the area outside the square
+    y, x = np.ogrid[:data_shape[0], :data_shape[1]]
+    center_y, center_x = i + square_size // 2, j + square_size // 2
+    distance_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+    max_distance = strength * np.sqrt((data_shape[0] / 2)**2 + (data_shape[1] / 2)**2)
+    gradient_mask = 1 - np.clip(distance_from_center / max_distance, 0, 1)
+
+    # Apply the gradient mask to the area outside the central square
+    mask[i:i+square_size, j:j+square_size] = 1
+    mask = np.maximum(mask, gradient_mask)
+
+    # Apply the mask to the frame
+    blurred_frame = frame * mask
+
+    # Plot the blurred frame and the corresponding rose plot
+    fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+    ax_blur = axs[0]
+    ax_polar = fig.add_subplot(122, polar=True)  # Ensure the second subplot is a polar plot
+    cmap = plt.get_cmap('coolwarm')
+    colors = cmap(np.linspace(0, 1, len(wavenumber_values)))
+
+    directions = all_directions[square_number]
+    amplitudes = all_amplitudes[square_number]
+
+    for i, wavenumber in enumerate(wavenumber_values):
+        if i < len(directions) and i < len(amplitudes):
+            direction = directions[i]
+            amplitude = amplitudes[i]
+
+            if log:
+                # Apply log scale to amplitudes
+                amplitude = np.log(amplitude + 1)  # Adding 1 to avoid log(0)
+
+            # Wrap angles to the range [0, 360] degrees
+            direction_wrapped = np.mod(direction, 360)
+
+            # Plot the histogram for both directions with the same amplitude
+            for d in direction_wrapped:
+                ax_polar.bar(np.deg2rad(d), amplitude, width=np.deg2rad(10), color=colors[i], alpha=0.6, edgecolor='k', label=f'{wavenumber:.3f}' if d == direction_wrapped[0] else "")
+
+    ax_polar.set_title('Circular Spectrum of Directional Angles')
+    ax_polar.set_theta_zero_location('N')
+    ax_polar.set_theta_direction(-1)
+    ax_polar.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
+
+    ax_blur.imshow(blurred_frame, cmap='gray')
+    ax_blur.set_title(f'Square {square_number} Blurred Frame')
+
+    plt.show()
     
