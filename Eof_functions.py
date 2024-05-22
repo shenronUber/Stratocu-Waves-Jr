@@ -95,7 +95,6 @@ def Calculate_Advection(frame_a,frame_b):
                 +0.000001)) # avoid division by zero
     return a2
 
-
 def Show_Advection(frame_a, frame_b):
     
     plt.figure(figsize=[10,5]) # type: ignore
@@ -1222,11 +1221,10 @@ def visualize_results(frames, frame, all_directions, all_amplitudes, wavenumber_
     ax_polar.set_theta_direction(-1)
     ax_polar.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
 
-    ax_blur.imshow(blurred_frame, cmap='gray')
+    ax_blur.pcolormesh(blurred_frame, cmap='gray')
     ax_blur.set_title(f'Square {square_number} Blurred Frame')
 
     plt.show()
-    
 
 def analyze_frame_SFilt(frames, frame, square_size=256, overlap=0.5, strength=0.75, kl_cutoff_inf=0.01, 
                   kl_cutoff_sup=0.1, wavenumber_step=0.01, c_cutoff_inf=0, c_cutoff_sup=500, Filter=True, log=True, plot_condition=False):
@@ -1462,8 +1460,90 @@ def visualize_results_SFilt(frames, frame, all_directions, all_amplitudes, waven
     ax_polar.set_theta_direction(-1)
     ax_polar.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
 
-    ax_blur.imshow(blurred_frame, cmap='gray')
+    ax_blur.pcolormesh(blurred_frame, cmap='gray')
     ax_blur.set_title(f'Square {square_number} Blurred Frame')
 
     plt.show()
     
+def Visualize_Filter(frames,frame,kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, c_cutoff_sup=500, Amp=False):
+    data = frames
+    data_shape = data.shape
+    data_w = np.copy(data)
+
+    # Needs a rework for dynamic determination of the time dimension
+    # for dim in range(1, 3):  # This changes from range(3) to range(1, 3)
+    #     border_size = int(data_shape[dim] * 0.1)  # 10% of the dimension size
+    #     if border_size < 1:
+    #         border_size = 1  # Ensure at least one point gets the window applied
+        
+    #     full_window = np.hanning(2 * border_size)  # Full window for both sides
+    #     window = np.ones(data_shape[dim])  # Create a window array full of ones
+    #     window[:border_size] = full_window[:border_size]
+    #     window[-border_size:] = full_window[border_size:]
+
+    #     # Reshape the window to match the data dimension
+    #     if dim == 1:
+    #         window = window[np.newaxis, :, np.newaxis]
+    #     elif dim == 2:
+    #         window = window[np.newaxis, np.newaxis, :]
+
+    #     # Multiply the data with the window
+    #     data_w *= window
+
+    # Perform 3D FFT
+    # fft_data = np.fft.fftn(data_w)
+    fft_data = np.fft.fftn(data)
+    fft_data = np.fft.fftshift(fft_data)
+
+    # Calculate kl unitlessly for each pixel
+    k = np.fft.fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1])) 
+    l = np.fft.fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
+    k, l = np.meshgrid(k, l)
+
+    k = k/(data_shape[1])
+    l = l/(data_shape[0])
+
+
+    kl = np.sqrt(k**2 + l**2)
+    kl = np.repeat(kl[:, :,np.newaxis], data_shape[2], axis=2)
+
+
+    # Frequency components as unitless (normalized index positions)
+    f = np.fft.fftfreq(data_shape[2])
+    f = np.repeat(f[np.newaxis, :], data_shape[1], axis=0)
+    f = np.repeat(f[np.newaxis, :, :], data_shape[0], axis=0)
+    f = np.fft.fftshift(f)
+
+    # Calculate unitless phase speed
+    kl[kl == 0] = np.inf  # Avoid division by zero
+    c = np.abs(f) / kl  # c is unitless
+    kl[kl == np.inf] = 0
+
+
+    filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (kl >= kl_cutoff_inf) & (kl <= kl_cutoff_sup) 
+
+    # Apply the mask to the FFT data
+
+    fft_data[~filter_mask] = 0
+
+    fft_data = np.fft.ifftshift(fft_data)
+    fft_data = np.fft.ifftn(fft_data)
+    frame = np.real(fft_data)
+
+    if  Amp == True:
+        frame = np.abs(frame)
+
+    data_shape = frame.shape
+
+    plt.figure(figsize=(16*2, 4*2))
+
+    plt.subplot(141)
+    plt.pcolormesh(frames[:,:,0], cmap='gray')
+    plt.title('Original Image')
+
+    plt.subplot(142)
+    plt.pcolormesh(frame[:,:,0], cmap='gray')
+    plt.title('Filtered Image')
+
+    plt.tight_layout()
+    plt.show()
