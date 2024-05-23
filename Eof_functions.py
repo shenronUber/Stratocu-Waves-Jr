@@ -20,6 +20,7 @@ from skimage import measure
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LinearRegression
 
+from mpl_toolkits.mplot3d import Axes3D
 
 def Calculate_Advection(frame_a,frame_b):
     # High pass the images to make sure the tracking is not of wave velocity itself
@@ -998,7 +999,7 @@ def Show_Power_Spectrum(frames,index=0,theta_coeff=0,spat_angle_cutoff_inf= -np.
 def bisinusoidal_func(theta, A1, phi1, C):
     return A1 * np.cos(2 * theta + phi1) +  C
 
-def analyze_frame(frames,frame, square_size=256, overlap=0.5, strength=0.75, kl_cutoff_inf=0.01, 
+def analyze_frame_SFilt(frames, frame_index, square_size=256, overlap=0.5, strength=0.75, kl_cutoff_inf=0.01, 
                   kl_cutoff_sup=0.1, wavenumber_step=0.01, c_cutoff_inf=0, c_cutoff_sup=500, Filter=True, log=True, plot_condition=False):
     
     data_shape = frames.shape
@@ -1018,248 +1019,26 @@ def analyze_frame(frames,frame, square_size=256, overlap=0.5, strength=0.75, kl_
     radius = np.sqrt(k**2 + l**2)
     theta = np.arctan2(l, k)
 
-    f = np.fft.fftfreq(np.min(data_shape))
-    f = np.fft.fftshift(f)
-
-    radius[radius == 0] = np.inf
-    c = np.abs(f[:, np.newaxis, np.newaxis]) / radius
-    c = c[0, :, :]
-    radius[radius == np.inf] = 0
-
-    filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (radius >= kl_cutoff_inf) & (radius <= kl_cutoff_sup) 
-
-    data_shape = frame.shape
-
-    for i in range(0, data_shape[0] - square_size + 1, step_size):
-        for j in range(0, data_shape[1] - square_size + 1, step_size):
-            # Create a mask for the entire frame
-            mask = np.zeros(data_shape)
-
-            # Create a 2D radial gradient mask for the area outside the square
-            y, x = np.ogrid[:data_shape[0], :data_shape[1]]
-            center_y, center_x = i + square_size // 2, j + square_size // 2
-            distance_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-            max_distance = strength * np.sqrt((data_shape[0] / 2)**2 + (data_shape[1] / 2)**2)
-            gradient_mask = 1 - np.clip(distance_from_center / max_distance, 0, 1)
-
-            # Apply the gradient mask to the area outside the central square
-            mask[i:i+square_size, j:j+square_size] = 1
-            mask = np.maximum(mask, gradient_mask)
-
-            # Apply the mask to the frame
-            blurred_frame = frame * mask
-
-            # Perform FFT on the entire frame
-            fft_data = fftn(blurred_frame)
-            fft_data = fftshift(fft_data) 
-
-            # Apply the mask to the FFT data
-            if Filter:
-                fft_data[~filter_mask] = 0
-
-            amplitude = np.abs(fft_data)
-
-            directions = []
-            amplitudes = []
-
-            for wavenumber in wavenumber_values:
-                mask = (radius > (wavenumber - wavenumber_step/2)) & (radius < (wavenumber + wavenumber_step/2))
-                if np.any(mask):
-                    extracted_data = amplitude[mask]
-                    theta_flat = theta[mask]
-                    
-                    # Create theta bins
-                    num_bins = 36  # 10 degrees each bin
-                    theta_bins = np.linspace(np.min(theta_flat), np.max(theta_flat), num_bins + 1)
-                    mean_amplitude = np.zeros(num_bins)
-
-                    for k in range(num_bins):
-                        in_bin = (theta_flat >= theta_bins[k]) & (theta_flat < (theta_bins[k + 1] if k < num_bins - 1 else theta_bins[k]))
-                        bin_data = extracted_data[in_bin]
-                        if len(bin_data) > 0:
-                            mean_amplitude[k] = np.mean(bin_data)
-                        else:
-                            mean_amplitude[k] = 0  # or another default value
-
-                    # Perform bisinusoidal fitting
-                    initial_guess = [np.max(mean_amplitude), 0, np.mean(mean_amplitude)]
-                    popt, _ = curve_fit(bisinusoidal_func, theta_bins[:-1], mean_amplitude, p0=initial_guess)
-
-                    # Calculate direction and amplitude based on the fit
-                    theta_fit = theta_bins[:-1]
-                    fitted_amplitude = bisinusoidal_func(theta_fit, *popt)
-                    max_indices = np.argsort(fitted_amplitude)[-2:]  # Indices of the two largest values
-
-                    direction_1 = theta_fit[max_indices[0]] * 180 / np.pi   # X value for the first maximum Y in degrees
-                    amplitude_1 = np.max([fitted_amplitude[max_indices[0]],fitted_amplitude[max_indices[1]]])  # First maximum Y value
-
-                    direction_2 = theta_fit[max_indices[1]] * 180 / np.pi   # X value for the second maximum Y in degrees
-
-                    # Plot the amplitude vs. angle and the fit if Plot is True
-                    if plot_condition:
-                        plt.figure(figsize=(10, 6))
-                        plt.plot(theta_bins[:-1] * 180 / np.pi, mean_amplitude, label='Mean Amplitude')
-                        plt.plot(theta_bins[:-1] * 180 / np.pi, bisinusoidal_func(theta_bins[:-1], *popt), 'r-', label='Bisinusoidal Fit')
-                        plt.title(f'Amplitude vs. Angle for Wavenumber {wavenumber}')
-                        plt.xlabel('Angle (degrees)')
-                        plt.ylabel('Amplitude')
-                        plt.legend()
-                        plt.grid(True)
-                        plt.show()
-                        print(f'Fitted parameters for wavenumber {wavenumber}: A1 = {popt[0]}, phi1 = {popt[1]}, C = {popt[2]}')
-
-                    # Print the calculated directions and amplitudes
-                    # print(f'Calculated directions: {direction_1} degrees, {direction_2} degrees')
-                    # print(f'Calculated amplitude: {amplitude_1}')
-
-                    # Store direction and amplitude data
-                    directions.append((direction_1, direction_2))
-                    amplitudes.append(amplitude_1)
-
-            all_directions.append(directions)
-            all_amplitudes.append(amplitudes)
-
-    return all_directions, all_amplitudes, wavenumber_values
-
-def visualize_results(frames, frame, all_directions, all_amplitudes, wavenumber_values, 
-                      square_number, square_size=256, overlap=0.5, strength=0.75,
-                       kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, 
-                       c_cutoff_sup=500, Filter=True,Amp=False, log=True):
-    
-    
-    data_shape = frame.shape
-    step_size = int(square_size * (1 - overlap))
-    num_squares_per_row = (data_shape[1] - square_size) // step_size + 1
-    
-    i = (square_number // num_squares_per_row) * step_size
-    j = (square_number % num_squares_per_row) * step_size
-
-    # Create a mask for the entire frame
-    mask = np.zeros(data_shape)
-
-    # Create a 2D radial gradient mask for the area outside the square
-    y, x = np.ogrid[:data_shape[0], :data_shape[1]]
-    center_y, center_x = i + square_size // 2, j + square_size // 2
-    distance_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
-    max_distance = strength * np.sqrt((data_shape[0] / 2)**2 + (data_shape[1] / 2)**2)
-    gradient_mask = 1 - np.clip(distance_from_center / max_distance, 0, 1)
-
-    # Apply the gradient mask to the area outside the central square
-    mask[i:i+square_size, j:j+square_size] = 1
-    mask = np.maximum(mask, gradient_mask)
-
-    # Apply the mask to the frame
-    blurred_frame = frame * mask
-
-    data_shape = frames.shape
-
-    # Perform FFT on the entire frame
-    fft_data = fftn(blurred_frame)
-    fft_data = fftshift(fft_data)
-
-    # Calculate kl unitlessly for each pixel
-    k = fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
-    l = fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
-    k, l = np.meshgrid(k, l)
-
-    k = k / data_shape[1]
-    l = l / data_shape[0]
-
-    radius = np.sqrt(k**2 + l**2)
-    theta = np.arctan2(l, k)
+    kl = np.repeat(radius[:, :,np.newaxis], data_shape[2], axis=2)
 
     # Frequency components as unitless (normalized index positions)
-    f = np.fft.fftfreq(np.min(data_shape))
+    f = np.fft.fftfreq(data_shape[2])
+    f = np.repeat(f[np.newaxis, :], data_shape[1], axis=0)
+    f = np.repeat(f[np.newaxis, :, :], data_shape[0], axis=0)
     f = np.fft.fftshift(f)
 
     # Calculate unitless phase speed
-    radius[radius == 0] = np.inf  # Avoid division by zero
-    c = np.abs(f[:, np.newaxis, np.newaxis]) / radius  # c is unitless
-    c = c[0, :, :]  # Take the first frame only
-    radius[radius == np.inf] = 0
+    kl[kl == 0] = np.inf  # Avoid division by zero
+    c = np.abs(f) / kl  # c is unitless
+    kl[kl == np.inf] = 0
 
-    filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (radius >= kl_cutoff_inf) & (radius <= kl_cutoff_sup) 
-
-    # Apply the mask to the FFT data
-    if Filter:
-        fft_data[~filter_mask] = 0
-
-    fft_data = np.fft.ifftshift(fft_data)
-    fft_data = np.fft.ifftn(fft_data)
-    blurred_frame = np.real(fft_data)
-    if Amp:
-        blurred_frame = np.abs(blurred_frame)
-
-    # Plot the blurred frame and the corresponding rose plot
-    fig, axs = plt.subplots(1, 2, figsize=(12, 6))
-    ax_blur = axs[0]
-    ax_polar = fig.add_subplot(122, polar=True)  # Ensure the second subplot is a polar plot
-    cmap = plt.get_cmap('coolwarm')
-    colors = cmap(np.linspace(0, 1, len(wavenumber_values)))
-
-    directions = all_directions[square_number]
-    amplitudes = all_amplitudes[square_number]
-
-    for i, wavenumber in enumerate(wavenumber_values):
-        if i < len(directions) and i < len(amplitudes):
-            direction = directions[i]
-            amplitude = amplitudes[i]
-
-            if log:
-                # Apply log scale to amplitudes
-                amplitude = np.log(amplitude + 1)  # Adding 1 to avoid log(0)
-
-            # Wrap angles to the range [0, 360] degrees
-            direction_wrapped = np.mod(direction, 360)
-
-            # Plot the histogram for both directions with the same amplitude
-            for d in direction_wrapped:
-                ax_polar.bar(np.deg2rad(d), amplitude, width=np.deg2rad(10), color=colors[i], alpha=0.6, edgecolor='k', label=f'{wavenumber:.3f}' if d == direction_wrapped[0] else "")
-
-    ax_polar.set_title('Circular Spectrum of Directional Angles')
-    ax_polar.set_theta_zero_location('N')
-    ax_polar.set_theta_direction(-1)
-    ax_polar.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
-
-    ax_blur.pcolormesh(blurred_frame, cmap='gray')
-    ax_blur.set_title(f'Square {square_number} Blurred Frame')
-
-    plt.show()
-
-def analyze_frame_SFilt(frames, frame, square_size=256, overlap=0.5, strength=0.75, kl_cutoff_inf=0.01, 
-                  kl_cutoff_sup=0.1, wavenumber_step=0.01, c_cutoff_inf=0, c_cutoff_sup=500, Filter=True, log=True, plot_condition=False):
-    
-    data_shape = frames.shape
-    all_directions = []
-    all_amplitudes = []
-
-
-    step_size = int(square_size * (1 - overlap))
-    wavenumber_values = np.arange(kl_cutoff_inf, kl_cutoff_sup, wavenumber_step)
-
-    k = fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
-    l = fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
-    k, l = np.meshgrid(k, l)
-    k = k / data_shape[1]
-    l = l / data_shape[0]
-
-    radius = np.sqrt(k**2 + l**2)
-    theta = np.arctan2(l, k)
-
-    f = np.fft.fftfreq(np.min(data_shape))
-    f = np.fft.fftshift(f)
-
-    radius[radius == 0] = np.inf
-    c = np.abs(f[:, np.newaxis, np.newaxis]) / radius
-    c = c[0, :, :]
-    radius[radius == np.inf] = 0
 
     if Filter:
-        filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (radius >= kl_cutoff_inf) & (radius <= kl_cutoff_sup) 
+        filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (kl >= kl_cutoff_inf) & (kl <= kl_cutoff_sup) 
 
         # Perform FFT on the entire frame
-        fft_data = fftn(frame)
-        fft_data = fftshift(fft_data) 
+        fft_data = np.fft.fftn(frames)
+        fft_data = np.fft.fftshift(fft_data)
 
         # Apply the mask to the FFT data
         fft_data[~filter_mask] = 0
@@ -1267,8 +1046,9 @@ def analyze_frame_SFilt(frames, frame, square_size=256, overlap=0.5, strength=0.
         # Perform IFFT on the filtered data
         fft_data = np.fft.ifftshift(fft_data)
         fft_data = np.fft.ifftn(fft_data)
-        frame = np.real(fft_data)
-
+        frames = np.real(fft_data)
+        
+    frame = frames[:,:,frame_index]
     data_shape = frame.shape
 
     for i in range(0, data_shape[0] - square_size + 1, step_size):
@@ -1358,52 +1138,58 @@ def analyze_frame_SFilt(frames, frame, square_size=256, overlap=0.5, strength=0.
 
     return all_directions, all_amplitudes, wavenumber_values
 
-def visualize_results_SFilt(frames, frame, all_directions, all_amplitudes, wavenumber_values, 
+def visualize_results_SFilt(frames, frame_index, all_directions, all_amplitudes, wavenumber_values, 
                       square_number, square_size=256, overlap=0.5, strength=0.75,
                        kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, 
-                       c_cutoff_sup=500, Filter=True,Amp=False, log=True):
+                       c_cutoff_sup=500, Filter=True,Amp=False, log=True, Km=True):
     
     data_shape = frames.shape
 
     # Filter the frame first
     if Filter:
         # Perform FFT on the entire frame
-        fft_data = fftn(frame)
-        fft_data = fftshift(fft_data)
+        fft_data = np.fft.fftn(frames)
+        fft_data = np.fft.fftshift(fft_data)
 
-            # Calculate kl unitlessly for each pixel
-        k = fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
-        l = fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
+        # Calculate kl unitlessly for each pixel
+        k = np.fft.fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1])) 
+        l = np.fft.fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
         k, l = np.meshgrid(k, l)
 
-        k = k / data_shape[1]
-        l = l / data_shape[0]
+        k = k/(data_shape[1])
+        l = l/(data_shape[0])
 
-        radius = np.sqrt(k**2 + l**2)
-        theta = np.arctan2(l, k)
+
+        kl = np.sqrt(k**2 + l**2)
+        kl = np.repeat(kl[:, :,np.newaxis], data_shape[2], axis=2)
+
 
         # Frequency components as unitless (normalized index positions)
-        f = np.fft.fftfreq(data_shape[0])
+        f = np.fft.fftfreq(data_shape[2])
+        f = np.repeat(f[np.newaxis, :], data_shape[1], axis=0)
+        f = np.repeat(f[np.newaxis, :, :], data_shape[0], axis=0)
         f = np.fft.fftshift(f)
 
         # Calculate unitless phase speed
-        radius[radius == 0] = np.inf  # Avoid division by zero
-        c = np.abs(f[:, np.newaxis, np.newaxis]) / radius  # c is unitless
-        c = c[0, :, :]  # Take the first frame only
-        radius[radius == np.inf] = 0
+        kl[kl == 0] = np.inf  # Avoid division by zero
+        c = np.abs(f) / kl  # c is unitless
+        kl[kl == np.inf] = 0
 
-        filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (radius >= kl_cutoff_inf) & (radius <= kl_cutoff_sup) 
+
+        filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (kl >= kl_cutoff_inf) & (kl <= kl_cutoff_sup) 
 
         # Apply the mask to the FFT data
-        
+
         fft_data[~filter_mask] = 0
 
         fft_data = np.fft.ifftshift(fft_data)
         fft_data = np.fft.ifftn(fft_data)
-        frame = np.real(fft_data)
-        if Amp == True:
-            frame = np.abs(frame)
+        frames = np.real(fft_data)
 
+        if  Amp == True:
+            frames = np.abs(frames)
+        
+    frame = frames[:,:,frame_index]
     data_shape = frame.shape
 
     step_size = int(square_size * (1 - overlap))
@@ -1453,8 +1239,11 @@ def visualize_results_SFilt(frames, frame, all_directions, all_amplitudes, waven
 
             # Plot the histogram for both directions with the same amplitude
             for d in direction_wrapped:
-                ax_polar.bar(np.deg2rad(d), amplitude, width=np.deg2rad(10), color=colors[i], alpha=0.6, edgecolor='k', label=f'{wavenumber:.3f}' if d == direction_wrapped[0] else "")
-
+                if Km == True:
+                    ax_polar.bar(np.deg2rad(d), amplitude, width=np.deg2rad(10), color=colors[i], alpha=0.6, edgecolor='k', label=f'{2*1/wavenumber:.3f}' if d == direction_wrapped[0] else "")
+                else:
+                    ax_polar.bar(np.deg2rad(d), amplitude, width=np.deg2rad(10), color=colors[i], alpha=0.6, edgecolor='k', label=f'{2*1/wavenumber:.3f}' if d == direction_wrapped[0] else "")
+                
     ax_polar.set_title('Circular Spectrum of Directional Angles')
     ax_polar.set_theta_zero_location('N')
     ax_polar.set_theta_direction(-1)
@@ -1464,7 +1253,7 @@ def visualize_results_SFilt(frames, frame, all_directions, all_amplitudes, waven
     ax_blur.set_title(f'Square {square_number} Blurred Frame')
 
     plt.show()
-    
+   
 def Visualize_Filter(frames,frame,kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, c_cutoff_sup=500, Amp=False):
     data = frames
     data_shape = data.shape
@@ -1546,4 +1335,58 @@ def Visualize_Filter(frames,frame,kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutof
     plt.title('Filtered Image')
 
     plt.tight_layout()
+    plt.show()   
+
+def Visualize_Filter_3D(frames,kl_inf = 0.00666666666, kl_sup = 0.06666666666, c_inf = 12, c_sup = 17):
+        
+    data_shape = frames.shape
+
+    k = fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
+    l = fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
+    k, l = np.meshgrid(k, l)
+    k = k / data_shape[1]
+    l = l / data_shape[0]
+
+    radius = np.sqrt(k**2 + l**2)
+    theta = np.arctan2(l, k)
+
+    kl = np.repeat(radius[:, :,np.newaxis], data_shape[2], axis=2)
+
+    # Frequency components as unitless (normalized index positions)
+    f = np.fft.fftfreq(data_shape[2])
+    f = np.repeat(f[np.newaxis, :], data_shape[1], axis=0)
+    f = np.repeat(f[np.newaxis, :, :], data_shape[0], axis=0)
+    f = np.fft.fftshift(f)
+
+    # Calculate unitless phase speed
+    kl[kl == 0] = np.inf  # Avoid division by zero
+    c = np.abs(f) / kl  # c is unitless
+    kl[kl == np.inf] = 0
+
+    filter_mask = (c >= c_inf) & (c <= c_sup) & (kl >= kl_inf) & (kl <= kl_sup)
+
+    # Create a 3D plot
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Get the coordinates of the True values
+    x, y, z = np.nonzero(filter_mask)
+
+    # Plot the True values
+    ax.scatter(x, y, z, c='b', marker='o', alpha=0.1)
+
+
+    # Set labels
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+
+    # Set limits to better visualize
+    ax.set_xlim(filter_mask.shape[0]/4, 3*filter_mask.shape[0]/4)
+    ax.set_ylim(filter_mask.shape[1]/4, 3*filter_mask.shape[1]/4)
+    ax.set_zlim(0, filter_mask.shape[2])
+
+    # Adjust the viewing angle
+    ax.view_init(elev=20, azim=45)  # Adjust elev and azim to change the angle
+
     plt.show()
