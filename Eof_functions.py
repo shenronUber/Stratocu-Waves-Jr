@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib import colormaps
 from scipy.linalg import eigh
 from eofs.standard import Eof
-from scipy.fft import fftn, fft2, fftshift
+from scipy.fft import fft2, ifft2, fftn, ifftn, fftshift, ifftshift
 from scipy.optimize import curve_fit
 
 from PIL import Image
@@ -1388,5 +1388,310 @@ def Visualize_Filter_3D(frames,kl_inf = 0.00666666666, kl_sup = 0.06666666666, c
 
     # Adjust the viewing angle
     ax.view_init(elev=20, azim=45)  # Adjust elev and azim to change the angle
+
+    plt.show()
+
+def compute_phase_shift(frame1, frame2):
+    epsilon = 1e-10  # Small value to avoid division by zero
+    fft_frame1 = fft2(frame1)
+    fft_frame2 = fft2(frame2)
+    cross_power_spectrum = (fft_frame1 * np.conj(fft_frame2)) / (np.abs(fft_frame1 * np.conj(fft_frame2)) + epsilon)
+    phase_corr = np.abs(ifft2(cross_power_spectrum))
+    max_corr_idx = np.unravel_index(np.argmax(phase_corr), phase_corr.shape)
+    shift_vector = np.array(max_corr_idx) - np.array(frame1.shape) // 2
+    return shift_vector
+
+def filter_frames(frames, kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, c_cutoff_sup=500):
+    data_shape = frames.shape
+    fft_data = np.fft.fftn(frames)
+    fft_data = np.fft.fftshift(fft_data)
+
+    k = np.fft.fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
+    l = np.fft.fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
+    k, l = np.meshgrid(k, l)
+    k = k / data_shape[1]
+    l = l / data_shape[0]
+
+    radius = np.sqrt(k**2 + l**2)
+
+    kl = np.repeat(radius[:, :, np.newaxis], data_shape[2], axis=2)
+
+    f = np.fft.fftfreq(data_shape[2])
+    f = np.repeat(f[np.newaxis, :], data_shape[1], axis=0)
+    f = np.repeat(f[np.newaxis, :, :], data_shape[0], axis=0)
+    f = np.fft.fftshift(f)
+
+    kl[kl == 0] = np.inf
+    c = np.abs(f) / kl
+    kl[kl == np.inf] = 0
+
+    filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (kl >= kl_cutoff_inf) & (kl <= kl_cutoff_sup)
+    fft_data[~filter_mask] = 0
+
+    fft_data = np.fft.ifftshift(fft_data)
+    filtered_frames = np.real(np.fft.ifftn(fft_data))
+
+    return filtered_frames
+
+def infer_propagation_direction(frames, square_number=None, square_size=256, strength=0.5, overlap=0.5, kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, c_cutoff_sup=500, Filter=True):
+    if Filter:
+        frames = filter_frames(frames, kl_cutoff_inf, kl_cutoff_sup, c_cutoff_inf, c_cutoff_sup)
+    
+    data_shape = frames.shape
+    mask = None
+    if square_number is not None:
+        step_size = int(square_size * (1 - overlap))
+        num_squares_per_row = (data_shape[1] - square_size) // step_size + 1
+        
+        i = (square_number // num_squares_per_row) * step_size
+        j = (square_number % num_squares_per_row) * step_size
+
+        # Create a mask for the entire frame
+        mask = np.zeros((data_shape[0], data_shape[1]))
+
+        # Create a 2D radial gradient mask for the area outside the square
+        y, x = np.ogrid[:data_shape[0], :data_shape[1]]
+        center_y, center_x = i + square_size // 2, j + square_size // 2
+        distance_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+        max_distance = strength * np.sqrt((data_shape[0] / 2)**2 + (data_shape[1] / 2)**2)
+        gradient_mask = 1 - np.clip(distance_from_center / max_distance, 0, 1)
+
+        # Apply the gradient mask to the area outside the central square
+        mask[i:i+square_size, j:j+square_size] = 1
+        mask = np.maximum(mask, gradient_mask)
+
+        # Apply the mask to all frames
+        for frame_index in range(data_shape[2]):
+            frames[:, :, frame_index] *= mask
+    
+    num_frames = frames.shape[2]
+    total_shift = np.array([0, 0], dtype=float)
+    for frame_index in range(num_frames - 1):
+        frame1 = frames[:, :, frame_index]
+        frame2 = frames[:, :, frame_index + 1]
+        shift_vector = compute_phase_shift(frame1, frame2)
+        total_shift += shift_vector
+    avg_shift = total_shift / (num_frames - 1)
+    avg_direction = np.arctan2(avg_shift[0], avg_shift[1])
+    # Adjust the direction to make 0 degrees at the north and measure clockwise
+    avg_direction = (np.pi / 2) - avg_direction
+    # Ensure the angle is within the range [0, 360) degrees
+    avg_direction_deg = (np.degrees(avg_direction) + 360) % 360
+    return avg_direction_deg, avg_shift, mask, (i, j, square_size)
+
+def analyze_amplitude_directions(blurred_frame, radius, theta, wavenumber, wavenumber_step, num_bins=36):
+    mask = (radius > (wavenumber - wavenumber_step/2)) & (radius < (wavenumber + wavenumber_step/2))
+    if np.any(mask):
+        extracted_data = blurred_frame[mask]
+        theta_flat = theta[mask]
+        
+        theta_bins = np.linspace(np.min(theta_flat), np.max(theta_flat), num_bins + 1)
+        mean_amplitude = np.zeros(num_bins)
+
+        for k in range(num_bins):
+            in_bin = (theta_flat >= theta_bins[k]) & (theta_flat < (theta_bins[k + 1] if k < num_bins - 1 else theta_bins[k]))
+            bin_data = extracted_data[in_bin]
+            if len(bin_data) > 0:
+                mean_amplitude[k] = np.mean(bin_data)
+            else:
+                mean_amplitude[k] = 0
+
+        initial_guess = [np.max(mean_amplitude), 0, np.mean(mean_amplitude)]
+        popt, _ = curve_fit(bisinusoidal_func, theta_bins[:-1], mean_amplitude, p0=initial_guess)
+
+        theta_fit = theta_bins[:-1]
+        fitted_amplitude = bisinusoidal_func(theta_fit, *popt)
+        max_indices = np.argsort(fitted_amplitude)[-2:]
+
+        direction_1 = theta_fit[max_indices[0]] * 180 / np.pi
+        direction_2 = theta_fit[max_indices[1]] * 180 / np.pi
+        amplitude_1 = np.max([fitted_amplitude[max_indices[0]], fitted_amplitude[max_indices[1]]])
+
+        return amplitude_1, [direction_1, direction_2]
+    else:
+        return 0, []
+
+def find_best_wavenumber_match(frames, frame_index, propagation_direction, square_size=256, overlap=0.5, strength=0.5, kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, wavenumber_step=0.01, c_cutoff_inf=0, c_cutoff_sup=500, Filter=True):
+    data_shape = frames.shape
+
+    # Step 1: Pre-process the Frames
+    if Filter:
+        frames = filter_frames(frames, kl_cutoff_inf, kl_cutoff_sup, c_cutoff_inf, c_cutoff_sup)
+
+    # Apply masking and get the blurred frame
+    step_size = int(square_size * (1 - overlap))
+    y, x = np.ogrid[:data_shape[0], :data_shape[1]]
+    center_y, center_x = data_shape[0] // 2, data_shape[1] // 2
+    distance_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+    max_distance = strength * np.sqrt((data_shape[0] / 2)**2 + (data_shape[1] / 2)**2)
+    gradient_mask = 1 - np.clip(distance_from_center / max_distance, 0, 1)
+    frame = frames[:, :, frame_index] * gradient_mask
+
+    k = fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1]))
+    l = fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
+    k, l = np.meshgrid(k, l)
+    k = k / data_shape[1]
+    l = l / data_shape[0]
+    radius = np.sqrt(k**2 + l**2)
+    theta = np.arctan2(l, k)
+
+    blurred_frame_fft = fftshift(fftn(frame))
+    amplitude = np.abs(blurred_frame_fft)
+
+    # Step 2: Initial Wavenumber Analysis
+    wavenumber_values = np.arange(kl_cutoff_inf, kl_cutoff_sup, wavenumber_step)
+    best_wavenumber = None
+    best_amplitude = -np.inf
+    closest_direction_diff = np.inf
+
+    for wavenumber in wavenumber_values:
+        mean_amplitude, directions = analyze_amplitude_directions(amplitude, radius, theta, wavenumber, wavenumber_step)
+        for direction in directions:
+            direction_diff = abs(direction - propagation_direction) % 360
+            if direction_diff < closest_direction_diff:
+                closest_direction_diff = direction_diff
+                best_wavenumber = wavenumber
+                best_amplitude = mean_amplitude
+
+    # Step 3: Iterative Refinement
+    refinement_steps = 0
+    while wavenumber_step > 0.001:  # Adjust the threshold as needed
+        refinement_steps += 1
+        kl_cutoff_inf = max(best_wavenumber - wavenumber_step, kl_cutoff_inf)
+        kl_cutoff_sup = min(best_wavenumber + wavenumber_step, kl_cutoff_sup)
+        wavenumber_values = np.arange(kl_cutoff_inf, kl_cutoff_sup, wavenumber_step)
+        wavenumber_step /= 2
+
+        for wavenumber in wavenumber_values:
+            mean_amplitude, directions = analyze_amplitude_directions(amplitude, radius, theta, wavenumber, wavenumber_step)
+            for direction in directions:
+                direction_diff = abs(direction - propagation_direction) % 360
+                if direction_diff < closest_direction_diff:
+                    closest_direction_diff = direction_diff
+                    best_wavenumber = wavenumber
+                    best_amplitude = mean_amplitude
+
+    # Step 4: Final Wavenumber Match
+    return best_wavenumber, best_amplitude, refinement_steps
+
+def visualize_results_SFilt_Best_Wavenumber(frames, frame_index, propagation_direction, best_wavenumber, best_amplitude, avg_shift, 
+                      square_number, square_size=256, overlap=0.5, strength=0.5,
+                       kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, 
+                       c_cutoff_sup=500, Filter=True,Amp=False, log=True, Km=True):
+    
+    data_shape = frames.shape
+
+    # Filter the frame first
+    if Filter:
+        # Perform FFT on the entire frame
+        fft_data = np.fft.fftn(frames)
+        fft_data = np.fft.fftshift(fft_data)
+
+        # Calculate kl unitlessly for each pixel
+        k = np.fft.fftshift(np.fft.fftfreq(data_shape[1], d=1/data_shape[1])) 
+        l = np.fft.fftshift(np.fft.fftfreq(data_shape[0], d=1/data_shape[0]))
+        k, l = np.meshgrid(k, l)
+
+        k = k/(data_shape[1])
+        l = l/(data_shape[0])
+
+
+        kl = np.sqrt(k**2 + l**2)
+        kl = np.repeat(kl[:, :,np.newaxis], data_shape[2], axis=2)
+
+
+        # Frequency components as unitless (normalized index positions)
+        f = np.fft.fftfreq(data_shape[2])
+        f = np.repeat(f[np.newaxis, :], data_shape[1], axis=0)
+        f = np.repeat(f[np.newaxis, :, :], data_shape[0], axis=0)
+        f = np.fft.fftshift(f)
+
+        # Calculate unitless phase speed
+        kl[kl == 0] = np.inf  # Avoid division by zero
+        c = np.abs(f) / kl  # c is unitless
+        kl[kl == np.inf] = 0
+
+
+        filter_mask = (c >= c_cutoff_inf) & (c <= c_cutoff_sup) & (kl >= kl_cutoff_inf) & (kl <= kl_cutoff_sup) 
+
+        # Apply the mask to the FFT data
+
+        fft_data[~filter_mask] = 0
+
+        fft_data = np.fft.ifftshift(fft_data)
+        fft_data = np.fft.ifftn(fft_data)
+        frames = np.real(fft_data)
+
+        if  Amp == True:
+            frames = np.abs(frames)
+        
+    frame = frames[:,:,frame_index]
+    data_shape = frame.shape
+
+    step_size = int(square_size * (1 - overlap))
+    num_squares_per_row = (data_shape[1] - square_size) // step_size + 1
+    
+    i = (square_number // num_squares_per_row) * step_size
+    j = (square_number % num_squares_per_row) * step_size
+
+    # Create a mask for the entire frame
+    mask = np.zeros(data_shape)
+
+    # Create a 2D radial gradient mask for the area outside the square
+    y, x = np.ogrid[:data_shape[0], :data_shape[1]]
+    center_y, center_x = i + square_size // 2, j + square_size // 2
+    distance_from_center = np.sqrt((x - center_x)**2 + (y - center_y)**2)
+    max_distance = strength * np.sqrt((data_shape[0] / 2)**2 + (data_shape[1] / 2)**2)
+    gradient_mask = 1 - np.clip(distance_from_center / max_distance, 0, 1)
+
+    # Apply the gradient mask to the area outside the central square
+    mask[i:i+square_size, j:j+square_size] = 1
+    mask = np.maximum(mask, gradient_mask)
+
+    # Apply the mask to the frame
+    blurred_frame = frame * mask
+
+    # Plot the blurred frame and the corresponding rose plot
+    fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+    ax_blur = axs[0]
+    ax_polar = fig.add_subplot(122, polar=True)  # Ensure the second subplot is a polar plot
+    cmap = plt.get_cmap('coolwarm')
+
+    direction = propagation_direction, 
+    amplitude = best_amplitude
+    wavenumber= best_wavenumber 
+
+    if log:
+        # Apply log scale to amplitudes
+        amplitude = np.log(amplitude + 1)  # Adding 1 to avoid log(0)
+
+    # Wrap angles to the range [0, 360] degrees
+    direction_wrapped = np.mod(direction, 360)
+
+    # Plot the histogram for both directions with the same amplitude
+    for d in direction_wrapped:
+        if Km == True:
+            ax_polar.bar(np.deg2rad(d), amplitude, width=np.deg2rad(10), color='red' , alpha=0.6, edgecolor='k', label=f'{2*1/wavenumber:.3f}' if d == direction_wrapped[0] else "")
+        else:
+            ax_polar.bar(np.deg2rad(d), amplitude, width=np.deg2rad(10), color='red' , alpha=0.6, edgecolor='k', label=f'{2*1/wavenumber:.3f}' if d == direction_wrapped[0] else "")
+
+    ax_polar.set_title('Circular Spectrum of Directional Angles')
+    ax_polar.set_theta_zero_location('N')
+    ax_polar.set_theta_direction(-1)
+    ax_polar.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
+
+    ax_blur.pcolormesh(blurred_frame, cmap='gray')
+    ax_blur.set_title(f'Square {square_number} Blurred Frame')
+
+    # Calculate the arrow starting point and length
+    i = (square_number // num_squares_per_row) * step_size
+    j = (square_number % num_squares_per_row) * step_size    
+    start_x = j + square_size // 2
+    start_y = i + square_size // 2
+    end_x = start_x + avg_shift[1] * 0.2  # Scale factor for visualization
+    end_y = start_y + avg_shift[0] * 0.2  # Scale factor for visualization
+
+    # Plot the arrow
+    ax_blur.arrow(start_x, start_y, end_x - start_x, end_y - start_y, color='red', head_width=20, head_length=30, linewidth=2)
 
     plt.show()
