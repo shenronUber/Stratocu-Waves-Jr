@@ -1256,7 +1256,7 @@ def visualize_results_SFilt(frames, frame_index, all_directions, all_amplitudes,
    
 def Visualize_Filter(frames,frame,kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, c_cutoff_sup=500, Amp=False):
     data = frames
-    data_shape = data.shape
+    data_shape = np.shape(data)
     data_w = np.copy(data)
 
     # Needs a rework for dynamic determination of the time dimension
@@ -1402,7 +1402,7 @@ def compute_phase_shift(frame1, frame2):
     return shift_vector
 
 def filter_frames(frames, kl_cutoff_inf=0.01, kl_cutoff_sup=0.1, c_cutoff_inf=0, c_cutoff_sup=500):
-    data_shape = frames.shape
+    data_shape = np.shape(frames)
     fft_data = np.fft.fftn(frames)
     fft_data = np.fft.fftshift(fft_data)
 
