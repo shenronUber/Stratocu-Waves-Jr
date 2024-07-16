@@ -22,6 +22,8 @@ from sklearn.linear_model import LinearRegression
 
 from mpl_toolkits.mplot3d import Axes3D
 
+from skimage import color, io, transform, feature, measure
+
 def Calculate_Advection(frame_a,frame_b):
     # High pass the images to make sure the tracking is not of wave velocity itself
     frame_a_hp = frame_a.copy() - smoo(frame_a, 10)
@@ -1695,3 +1697,99 @@ def visualize_results_SFilt_Best_Wavenumber(frames, frame_index, propagation_dir
     ax_blur.arrow(start_x, start_y, end_x - start_x, end_y - start_y, color='red', head_width=20, head_length=30, linewidth=2)
 
     plt.show()
+
+def Get_Wavelength_From_image(image, plot_option=False):
+    # Convert to grayscale if needed
+    if len(image.shape) == 3:
+        gray_image = color.rgb2gray(image)
+    else:
+        gray_image = image
+
+    # Create a circular mask to apply to the image
+    def circular_mask(image_shape):
+        center = (image_shape[0] // 2, image_shape[1] // 2)
+        radius = min(center[0], center[1], image_shape[0] - center[0], image_shape[1] - center[1])
+        Y, X = np.ogrid[:image_shape[0], :image_shape[1]]
+        dist_from_center = np.sqrt((X - center[1])**2 + (Y - center[0])**2)
+        mask = dist_from_center <= radius
+        return mask
+
+    # Apply the circular mask to the image
+    mask = circular_mask(gray_image.shape)
+    masked_image = np.zeros_like(gray_image)
+    masked_image[mask] = gray_image[mask]
+
+    # Apply Canny edge detection to enhance crests and troughs
+    edges = feature.canny(masked_image, sigma=2.5)
+
+    # Function to calculate the sum of horizontal intensities
+    def calculate_horizontal_intensity_sum(rotated_image):
+        horizontal_profile = np.sum(rotated_image, axis=1)
+        return np.sum(horizontal_profile)
+
+    # Iterate through angles and find the one with the maximum sum of horizontal intensities
+    max_intensity_sum = 0
+    best_rotation_angle = 0
+    angles = np.linspace(0, 180, 180)  # 0 to 180 degrees with 1 degree increments to improve resolution
+    min_sum = 1
+
+    for angle in angles:
+        rotated_image = transform.rotate(edges, angle, resize=True)
+        labeled_image = measure.label(rotated_image)
+        regions = measure.regionprops(labeled_image)
+        centroid = regions[0].centroid
+        center_x = int(centroid[1])
+        vertical_profile = rotated_image[:, center_x]
+        white_pixel_positions = np.where(vertical_profile > 0)[0]
+        distances_between_crests = np.diff(white_pixel_positions)
+        average_distance = np.mean(distances_between_crests)
+        if white_pixel_positions.shape[0] > min_sum:
+            best_rotation_angle = angle
+            min_sum = white_pixel_positions.shape[0]
+
+    # Rotate the image to the best angle
+    best_rotation_angle = best_rotation_angle - 90
+    rotated_image = transform.rotate(edges, best_rotation_angle, resize=True)
+
+    # Recalculate the centroid of the rotated image
+    rotated_masked_image = transform.rotate(masked_image, best_rotation_angle, resize=True)
+    labeled_image = measure.label(rotated_image)
+    regions = measure.regionprops(labeled_image)
+    centroid = regions[0].centroid
+    center_x = int(centroid[1])
+    vertical_profile = rotated_image[:, center_x]
+    white_pixel_positions = np.where(vertical_profile > 0)[0]
+    distances_between_crests = np.diff(white_pixel_positions)
+    average_distance = np.mean(distances_between_crests)
+
+    # Calculate the wavelength
+    wavelength = average_distance * 2 * 2  # Multiply by 2 to get full wavelength, then by 2 kms per pixel
+
+    # Print the results
+    print("Best rotation angle (in degrees):", best_rotation_angle)
+    print("Average distance between crests (in pixels):", average_distance)
+    print("Average wavelength:", wavelength, "km")
+
+    # Plot the results if plot_option is True
+    if plot_option:
+        plt.figure(figsize=(10, 10))
+
+        plt.subplot(1, 2, 1)
+        plt.imshow(gray_image, cmap='gray')
+        plt.title('Grayscale Image')
+
+        plt.subplot(1, 2, 2)
+        plt.imshow(rotated_image, cmap='gray')
+        plt.axvline(x=center_x, color='r', linestyle='--')  # Draw vertical line through the recalculated center
+        plt.title(f'Rotated Image (angle: {best_rotation_angle:.2f} degrees)')
+
+        # plt.subplot(3, 1, 3)
+        # plt.plot(vertical_profile)
+        # plt.title('Vertical Profile at the Center')
+        # plt.xlabel('Pixel Position along Y-axis')
+        # plt.ylabel('Intensity')
+
+        plt.tight_layout()
+        plt.show()
+
+    return best_rotation_angle, average_distance, wavelength
