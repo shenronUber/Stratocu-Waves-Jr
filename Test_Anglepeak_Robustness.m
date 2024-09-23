@@ -70,19 +70,10 @@ title('areameanpower/meanbyscale')
 hold off 
 
 
-figure(7)
-image_with_wavelet_overlay(frame50, spec, Scales, 9,8); title('scale 9 angle 8')
-figure(8)
-image_with_wavelet_overlay(frame50, spec, Scales, 15,14); title('scale 15 angle 14')
-
-% figure(7)
-% image_with_wavelet_overlay(frame50, spec, Scales, 8,7); title('scale 8 angle 7')
-% figure(8)
-% image_with_wavelet_overlay(frame50, spec, Scales, 8,8); title('scale 8 angle 8')
-% figure(9)
-% image_with_wavelet_overlay(frame50, spec, Scales, 8,9); title('scale 8 angle 9')
-% figure(10)
-% image_with_wavelet_overlay(frame50, spec, Scales, 8,10); title('scale 8 angle 10')
+%figure(7)
+%image_with_wavelet_overlay(frame50, spec, Scales, 9,8); title('scale 9 angle 8')
+%figure(8)
+%image_with_wavelet_overlay(frame50, spec, Scales, 15,14); title('scale 15 angle 14')
 
 %%
 % Define scales and angles for the upper half
