@@ -42,7 +42,7 @@ Scales = Scales_km / pixel_size_km;
 
 % Windowing parameters
 window_buffer = round(10 / shrinkfactor); % Adjust window buffer based on shrink factor
-window_function = @hann; % Window function to apply (Hann window)
+
 
 % Preprocessing flag
 Preprocess_Flag = 1; % 1 is on / 0 is off
@@ -106,7 +106,31 @@ end
 % Display Frame 1 with Squares
 
 figure;
-imshow(frame1, []);
+%imshow(frame1, []);
+
+if size(frame1, 3) > 1
+    frame1 = double(frame1(:, :, 1));
+else
+    frame1 = double(frame1);
+end
+
+% Preprocess frames if needed
+if Preprocess_Flag
+    frame1 = preprocess_img(frame1);
+end
+
+% Définir les paramètres de la fenêtre radiale
+radius_factor = 1.1;  % 80% de l'image non affectée
+decay_rate = 0.05;  % Paramètre de contrôle pour la décroissance
+
+% Apply windowing only at the edges
+frame1_windowed = apply_radial_window(frame1,radius_factor, decay_rate);
+
+imshow(frame1_windowed, []);  % Display windowed frame1
+title('Windowed Frame 1');
+colormap('gray');  % Display in grayscale
+
+
 hold on;
 for idx = 1:length(squares)
     rectangle('Position', [squares(idx).x_range(1), squares(idx).y_range(1), ...
@@ -118,6 +142,7 @@ for idx = 1:length(squares)
 end
 title('Frame 1 with Squares');
 hold off;
+
 
 %% Process Frames and Squares
 
@@ -173,8 +198,8 @@ for frame_idx = 1:num_frames - 1
     end
 
     % Apply windowing to the entire frame
-    frame1_windowed = apply_window(frame1, window_function, window_buffer);
-    frame2_windowed = apply_window(frame2, window_function, window_buffer);
+    frame1_windowed = apply_radial_window(frame1,radius_factor, decay_rate);
+    frame2_windowed = apply_radial_window(frame2,radius_factor, decay_rate);
 
     % Adjust frame dimensions after applying buffer
     frame1_windowed = frame1_windowed(y_buffer_range, x_buffer_range);
@@ -278,7 +303,7 @@ fprintf('Total execution time: %.2f seconds.\n', toc(total_time));
 %% Analyze the data
 
 % Example function call (modify as needed)
-plot_waverose(1,23)
+plot_waverose(3,17)
 
 %% Supporting Functions
 
@@ -287,18 +312,6 @@ function img_processed = preprocess_img(img)
     img_processed = img;
     % Normalize to [0, 1]
     img_processed = (img_processed - min(img_processed(:))) / (max(img_processed(:)) - min(img_processed(:)));
-end
-
-function img_windowed = apply_window(img, window_function, ~)
-    % Apply windowing to reduce edge effects
-    [rows, cols] = size(img);
-    win_row = window_function(rows);
-    win_col = window_function(cols);
-    window = win_row * win_col';
-    img_windowed = img .* window;
-
-    % Apply buffer to the global frame
-    img_windowed = img_windowed;
 end
 
 function peak_list = find_peaks_and_speeds(coherence, phase_difference, Scales, Angles, pixel_size_km, time_interval)
@@ -407,10 +420,10 @@ end
 function plot_waverose(frame_id, square_id)
     %% Plot Waverose Function
     % This function generates an advanced rose plot for a specific frame and square.
+    % It also plots the coherence and phase difference maps for each peak.
 
     % Retrieve variables from the base workspace
     video_file = evalin('base', 'video_file');
-    shrinkfactor = evalin('base', 'shrinkfactor');
     invshrinkfactor = evalin('base', 'invshrinkfactor');
     pixel_size_km = evalin('base', 'pixel_size_km');
     Scales = evalin('base', 'Scales');
@@ -419,7 +432,8 @@ function plot_waverose(frame_id, square_id)
     squares = evalin('base', 'squares');
     Preprocess_Flag = evalin('base', 'Preprocess_Flag');
     window_buffer = evalin('base', 'window_buffer');
-    window_function = evalin('base', 'window_function');
+    radius_factor = evalin('base', 'radius_factor');
+    decay_rate = evalin('base', 'decay_rate');
 
     %% Read Video Frames
     % Initialize video reader
@@ -454,8 +468,9 @@ function plot_waverose(frame_id, square_id)
     end
 
     % Apply windowing to the entire frame
-    frame1_windowed = apply_window(frame1, window_function, window_buffer);
-    frame2_windowed = apply_window(frame2, window_function, window_buffer);
+    
+    frame1_windowed = apply_radial_window(frame1,radius_factor, decay_rate);
+    frame2_windowed = apply_radial_window(frame2,radius_factor, decay_rate);
 
     % Adjust frame dimensions after applying buffer
     [frame_height, frame_width] = size(frame1);
@@ -504,30 +519,30 @@ function plot_waverose(frame_id, square_id)
     %% Plot Advanced Rose Plot
     % Generate the advanced rose plot with power and coherence
     % Overlay the peaks on the plot
-    
+
     % Calculate inner power and coherence for plotting
-    buffer = round(max(Scales));
-    innerpower = squeeze(mean(mean(power1(buffer:end-buffer, buffer:end-buffer, :, :))));
-    innercoherence = squeeze(mean(mean(coherence(buffer:end-buffer, buffer:end-buffer, :, :))));
-    
+    buffer = 0; % Adjust buffer as needed
+    innerpower = squeeze(mean(mean(power1(buffer+1:end-buffer, buffer+1:end-buffer, :, :))));
+    innercoherence = squeeze(mean(mean(coherence(buffer+1:end-buffer, buffer+1:end-buffer, :, :))));
+
     % Normalize power and coherence by scale
     mean_power_byscale = mean(innerpower, 2);
     mean_coherence_byscale = mean(innercoherence, 2);
-    
+
     anglespec_power = innerpower ./ mean_power_byscale;
     anglespec_coherence = innercoherence ./ mean_coherence_byscale;
-    
+
     % Define angles for upper and lower halves
     Angles_pos = Angles;
     Angles_neg = Angles + pi;
-    
+
     % Prepare data for plotting
     [Theta_pos, R_pos] = meshgrid(Angles_pos, Scales);
     [X_pos, Y_pos] = pol2cart(Theta_pos, R_pos);
-    
+
     [Theta_neg, R_neg] = meshgrid(Angles_neg, Scales);
     [X_neg, Y_neg] = pol2cart(Theta_neg, R_neg);
-    
+
     % Plot the advanced rose plot
     figure;
     % Plot power (upper half)
@@ -540,12 +555,12 @@ function plot_waverose(frame_id, square_id)
     ax1.XTick = [];
     ax1.YTick = [];
     hold on;
-    
+
     % Plot coherence (lower half)
     ax2 = axes;
     pcolor(ax2, X_neg, Y_neg, anglespec_coherence);
     shading interp;
-    colormap(ax2, 'hot');
+    colormap(ax2, 'autumn');
     axis equal;
     set(ax2, 'Position', [0.1, 0.1, 0.75, 0.75]);
     ax2.XTick = [];
@@ -553,7 +568,7 @@ function plot_waverose(frame_id, square_id)
     set(ax2, 'Color', 'none');
     linkaxes([ax1, ax2]);
     hold on;
-    
+
     % Overlay peaks on the coherence plot
     if ~isempty(peak_list)
         max_scales = peak_list(1, :);
@@ -565,11 +580,11 @@ function plot_waverose(frame_id, square_id)
             text(ax2, peak_X(i) * 1.05, peak_Y(i) * 1.05, sprintf('%.2f m/s', peak_list(4, i)), 'Color', 'k', 'FontSize', 10);
         end
     end
-    
+
     % Adjust axes limits
     xlim(ax1, [min(X_pos(:)) - 1, max(X_pos(:)) + 1]);
     ylim(ax1, [min(Y_neg(:)) - 1, max(Y_pos(:)) + 1]);
-    
+
     %% Add Radial Rings and Angle Labels
     % Add radial rings corresponding to scales
     ring_radii = Scales;
@@ -581,7 +596,7 @@ function plot_waverose(frame_id, square_id)
         % Add scale labels
         text(ax1, ring_radii(i) * 1.05, 0, num2str(ring_radii(i), '%.2f'), 'HorizontalAlignment', 'left');
     end
-    
+
     % Add angle lines and labels
     angle_ticks = linspace(0, 2 * pi, 13);  % Every 30 degrees
     angle_labels = {'0', '\pi/6', '\pi/3', '\pi/2', '2\pi/3', '5\pi/6', '\pi', '7\pi/6', '4\pi/3', '3\pi/2', '5\pi/3', '11\pi/6', '2\pi'};
@@ -593,7 +608,7 @@ function plot_waverose(frame_id, square_id)
         plot(ax2, x_line, y_line, 'k--');
         text(ax1, x_line(2) * 1.1, y_line(2) * 1.1, angle_labels{i}, 'HorizontalAlignment', 'center');
     end
-    
+
     %% Add Colorbars
     original_pos = get(ax1, 'Position');
     c1 = colorbar(ax1, 'eastoutside');
@@ -602,7 +617,7 @@ function plot_waverose(frame_id, square_id)
     set(c1, 'Position', c1_pos);
     set(ax1, 'Position', original_pos);
     ylabel(c1, 'Power');
-    
+
     original_pos = get(ax2, 'Position');
     c2 = colorbar(ax2, 'westoutside');
     c2_pos = get(c2, 'Position');
@@ -610,7 +625,388 @@ function plot_waverose(frame_id, square_id)
     set(c2, 'Position', c2_pos);
     set(ax2, 'Position', original_pos);
     ylabel(c2, 'Coherence');
-    
+
     %% Set Titles
     sgtitle(sprintf('Advanced Rose Plot for Frame %d and Square %d', frame_id, square_id));
+
+    %% Additional Plots: Coherence Maps and Phase Difference Maps
+
+    % Define common fractions of pi for displaying angles
+    pi_fractions = {'0', '\pi/6', '\pi/4', '\pi/3', '\pi/2', '2\pi/3', '\pi', '4\pi/3', '3\pi/2', '2\pi'};
+    pi_fraction_values = [0, pi/6, pi/4, pi/3, pi/2, 2*pi/3, pi, 4*pi/3, 3*pi/2, 2*pi];
+
+    % Preallocate a third row for the phase mean values in peak_list
+    if size(peak_list, 1) < 3
+        peak_list(3, :) = NaN;
+    end
+
+    % Preallocate a cell array to store coherence masks
+    coherence_masks = cell(1, size(peak_list, 2));
+
+    %% Part 1: Plot coherence with red contour based on the 60% threshold
+    figure;
+
+    num_peaks = size(peak_list, 2);
+    ncols = ceil(sqrt(num_peaks));
+    nrows = ceil(num_peaks / ncols);
+
+    for i = 1:num_peaks
+
+        % Extract the real scale and angle from the peak_list
+        real_scale = peak_list(1, i);  % Scale from peak_list
+        real_angle = peak_list(2, i);  % Angle from peak_list
+
+        % Find the index of the closest scale in the Scales array
+        [~, scale_idx] = min(abs(Scales - real_scale));
+
+        % Define an Angles array corresponding to the indices in the coherence 4th dimension
+        num_angles = size(coherence, 4);  % Number of angles in coherence
+        Angles_array = Angles;  % Use the Angles array from your data
+
+        % Adjust real_angle if necessary (wrap around)
+        real_angle = mod(real_angle, 2*pi);
+
+        % Find the index of the closest angle in the Angles array
+        [~, angle_idx] = min(abs(Angles_array - real_angle));
+
+        % Extract the corresponding coherence slice for the current scale and angle
+        coherence_slice = coherence(:, :, scale_idx, angle_idx);
+
+        % Define the threshold for the top 60% of the max coherence value
+        coherence_max = max(coherence_slice(:));
+        coherence_threshold = 0.6 * coherence_max;
+
+        % Create the mask where coherence is above the threshold
+        coherence_mask = coherence_slice >= coherence_threshold;
+
+        % Store the mask in the cell array
+        coherence_masks{i} = coherence_mask;  % Store mask for later use
+
+        % Plot the coherence using imagesc
+        subplot(nrows, ncols, i);  % Subplot for multiple plots
+        imagesc(coherence_slice);
+        hold on;
+        % Find the indices where coherence_mask is true
+        [y, x] = find(coherence_mask);
+        
+        % Plot red scatter points at the positions where coherence_mask is true
+        scatter(x, y, 'r', 'filled');
+        
+        % Ensure axis is tight so that the scatter points align with the image
+        axis tight;
+
+        % Convert the real_angle to a fraction of pi for the title
+        [~, angle_fraction_idx] = min(abs(pi_fraction_values - real_angle));  % Find closest pi fraction
+        angle_str = pi_fractions{angle_fraction_idx};  % Get the corresponding fraction of pi string
+
+        % Set title with scale and angle in fractions of pi
+        title(['Scale: ', num2str(real_scale, '%.2f'), ', Angle: ', angle_str]);
+
+        % Customize the colorbar
+        colorbar;
+
+        % Set axis equal for consistent plotting
+        axis equal;
+        hold off;
+ 
+    end
+
+    sgtitle('Coherence with Mask for Each Scale/Angle Peak');
+
+    %% Part 2: Plot phase difference with masked values and compute mean
+    figure;
+
+    for i = 1:num_peaks
+
+        % Extract the real scale and angle from the peak_list
+        real_scale = peak_list(1, i);  % Scale from peak_list
+        real_angle = peak_list(2, i);  % Angle from peak_list
+
+        % Find the index of the closest scale in the Scales array
+        [~, scale_idx] = min(abs(Scales - real_scale));
+
+        % Define an Angles array corresponding to the indices in the phase_difference 4th dimension
+        num_angles = size(phase_difference, 4);  % Number of angles in phase_difference
+        Angles_array = Angles;  % Use the Angles array from your data
+
+        % Adjust real_angle if necessary (wrap around)
+        real_angle = mod(real_angle, 2*pi);
+
+        % Find the index of the closest angle in the Angles array
+        [~, angle_idx] = min(abs(Angles_array - real_angle));
+
+         % Convert the real_angle to a fraction of pi for the title
+        [~, angle_fraction_idx] = min(abs(pi_fraction_values - real_angle));  % Find closest pi fraction
+        angle_str = pi_fractions{angle_fraction_idx};  % Get the corresponding fraction of pi string
+
+        % Extract the corresponding phase_difference slice for the current scale and angle
+        phase_slice = phase_difference(:, :, scale_idx, angle_idx);
+
+        % Retrieve the corresponding mask from Part 1
+        coherence_mask = coherence_masks{i};  % Get the correct mask for this scale/angle
+
+        % Apply the mask from coherence to the phase slice (mask where phase should be visible)
+        phase_masked = phase_slice;
+        %phase_masked(~coherence_mask) = NaN;  % Set non-coherent areas to NaN
+
+        % Plot the phase_difference using imagesc
+        subplot(nrows, ncols, i);  % Subplot for multiple plots
+        imagesc(phase_masked);
+        hold on;
+
+        % Overlay the contour of the coherence mask
+        contour(coherence_mask, [1 1], 'r', 'LineWidth', 1);  % Red contour at mask boundary
+
+        % Set title with scale and angle in fractions of pi
+        title(['Scale: ', num2str(real_scale, '%.2f'), ', Angle: ', angle_str]);
+
+        % Customize the colorbar to display ticks from -pi to pi
+        c = colorbar;
+        caxis([-pi pi]);  % Set color axis limits from -pi to pi
+        set(c, 'Ticks', [-pi, -pi/2, 0, pi/2, pi], 'TickLabels', {'-\pi', '-\pi/2', '0', '\pi/2', '\pi'});
+
+        % Set axis equal for consistent plotting
+        axis equal;
+        axis tight;
+
+    end
+    hold off
+    % Customize the overall figure title
+    sgtitle('Phase Difference with Masked Regions for Each Scale/Angle Peak');
+%% 
+    figure;
+    for i = 1:num_peaks
+
+        % Extract the real scale and angle from the peak_list
+        real_scale = peak_list(1, i);  % Scale from peak_list
+        real_angle = peak_list(2, i);  % Angle from peak_list
+
+        % Find the index of the closest scale in the Scales array
+        [~, scale_idx] = min(abs(Scales - real_scale));
+
+        % Define an Angles array corresponding to the indices in the phase_difference 4th dimension
+        num_angles = size(phase_difference, 4);  % Number of angles in phase_difference
+        Angles_array = Angles;  % Use the Angles array from your data
+
+        % Adjust real_angle if necessary (wrap around)
+        real_angle = mod(real_angle, 2*pi);
+
+        % Find the index of the closest angle in the Angles array
+        [~, angle_idx] = min(abs(Angles_array - real_angle));
+
+         % Convert the real_angle to a fraction of pi for the title
+        [~, angle_fraction_idx] = min(abs(pi_fraction_values - real_angle));  % Find closest pi fraction
+        angle_str = pi_fractions{angle_fraction_idx};  % Get the corresponding fraction of pi string
+
+        % Second subplot grid: Display the corresponding frame and overlay the mask contour
+        subplot(nrows, ncols, i); % Subplot for frame and contour
+    
+        % Extract the corresponding frame section using the high-resolution frame (frame1)
+        x_range_high_res = round(squares(square_id).x_range);
+        y_range_high_res = round(squares(square_id).y_range);
+        frame_square_high_res = frame1_windowed(y_range_high_res, x_range_high_res);
+    
+        % Plot the high-resolution frame square
+        imagesc(frame_square_high_res);
+        colormap('gray');  % Display the frame in grayscale
+        hold on;
+    
+        % Overlay the contour of the coherence mask
+        contour(coherence_masks{i}, [1 1], 'r', 'LineWidth', 1);  % Red contour at mask boundary
+
+        % Ensure axis is tight
+        axis tight;
+        
+        % Set title with scale and angle in fractions of pi
+        title(['Scale: ', num2str(real_scale, '%.2f'), ', Angle: ', angle_str]);
+    
+        hold off;
+    end
+
+    %% Additional Plot: Overlay Wavelet Contours on the Image Zoomed into the Square
+
+    % Figure for the wavelet overlay plots
+    figure;
+    num_peaks = size(peak_list, 2);
+    ncols = ceil(sqrt(num_peaks));
+    nrows = ceil(num_peaks / ncols);
+    
+    for i = 1:num_peaks
+        % Extract the real scale and angle from the peak_list
+        real_scale = peak_list(1, i);  % Scale from peak_list
+        real_angle = peak_list(2, i);  % Angle from peak_list
+        
+        % Find the index of the closest scale in the Scales array
+        [~, scale_idx] = min(abs(Scales - real_scale));
+        
+        % Adjust real_angle if necessary (wrap around)
+        real_angle = mod(real_angle, 2*pi);
+        
+        % Find the index of the closest angle in the Angles array
+        [~, angle_idx] = min(abs(Angles - real_angle));
+        
+        % Extract the corresponding frame square (use the windowed frame)
+        frame_square = frame1_windowed(y_range, x_range);
+        
+        % Extract the wavelet coefficients for the square
+        spec_square = spec1(:, :, :, :);
+        
+        % Plot using image_with_wavelet_overlay
+        subplot(nrows, ncols, i);
+        clevfactor = 1;  % Adjust as needed
+        ProcessFlag = 1; % Use ProcessFlag = 1 for normalized display
+        
+        % Call the overlay function
+        image_with_wavelet_overlay(frame_square, spec_square, Scales, scale_idx, angle_idx, clevfactor, ProcessFlag);
+        
+        % Overlay the mask contour from coherence_mask
+        coherence_mask = coherence_masks{i};  % Get the mask for this peak
+        hold on;
+        contour(coherence_mask, [1 1], 'magenta', 'LineWidth', 1);  % Red contour at mask boundary
+        hold off;
+        
+        % Set title with scale and angle
+        title(sprintf('Scale: %.2f, Angle: %.2f°', real_scale, real_angle * (180/pi)));
+        
+        % Ensure axis is equal and tight
+        axis equal;
+        axis tight;
+    end
+    
+    sgtitle('Wavelet Contours Overlaid on Image Zoomed into Square');
+
+    %% Calculate Speed from Phase Shift
+
+    % Initialize arrays to store results
+    speeds = zeros(1, num_peaks);
+
+    for i = 1:num_peaks
+        % Extract scale and mean phase difference from peak_list
+        scale = peak_list(1, i);  % Scale in pixels
+        mean_phase_difference = peak_list(3, i);  % Mean phase difference in radians
+
+        % Calculate the wavelength in km
+        % Since scale is half the wavelength in pixels, and each pixel is pixel_size_km
+        wavelength_km = scale * 2 * pixel_size_km;
+
+        % Calculate the distance shift in km
+        distance_shift_km = mean_phase_difference * wavelength_km / (2 * pi);
+
+        % Calculate the speed in km/s
+        speed_km_per_s = distance_shift_km / time_interval;
+
+        % Store the results
+        speeds(i) = speed_km_per_s;
+
+        % Update the fourth row of peak_list with the speed in m/s
+        peak_list(4, i) = speed_km_per_s * 1000;  % Convert to m/s
+
+        % Plot the sine waves (optional)
+        x_values = linspace(0, wavelength_km, 100);
+        sine_wave_original = sin(2 * pi * x_values / wavelength_km);
+        sine_wave_with_phase = sin(2 * pi * x_values / wavelength_km + mean_phase_difference);
+
+        figure;
+        plot(x_values, sine_wave_original, 'b-', 'LineWidth', 2);
+        hold on;
+        plot(x_values, sine_wave_with_phase, 'r--', 'LineWidth', 2);
+        xlabel('Distance (km)');
+        ylabel('Amplitude');
+        legend('Original Sine Wave', 'Shifted Sine Wave');
+        title(sprintf('Sine Wave with Phase Shift for Peak %d\nScale: %.2f pixels, Wavelength: %.2f km\nPhase: %.4f radians (%.4f\\pi)\nShift: %.4f km, Speed: %.4f m/s', ...
+            i, scale, wavelength_km, mean_phase_difference, mean_phase_difference / pi, distance_shift_km, speed_km_per_s * 1000));
+        grid on;
+        xlim([0, wavelength_km]);
+        hold off;
+    end
+
+    % Display the updated peak_list
+    disp('Updated peak_list with mean phase values and speeds:');
+    disp('Rows: 1-Scale, 2-Angle, 3-Mean Phase Difference, 4-Speed (m/s)');
+    disp(peak_list);
+end
+
+function img_windowed = apply_radial_window(img, radius_factor, decay_rate)
+    % Apply a radial windowing effect that attenuates the image from the edges towards the center
+    % Parameters:
+    % - radius_factor: controls how quickly the window decays from the center (e.g., 0.8 means 80% of the image width/height will be unaffected)
+    % - decay_rate: controls the steepness of the attenuation (larger value makes the transition steeper)
+    
+    [rows, cols] = size(img);
+    
+    % Compute the center of the image
+    center_x = cols / 2;
+    center_y = rows / 2;
+    
+    % Create a meshgrid to calculate the distance from the center
+    [x, y] = meshgrid(1:cols, 1:rows);
+    
+    % Calculate the radial distance from the center for each pixel
+    distances = sqrt((x - center_x).^2 + (y - center_y).^2);
+    
+    % Calculate the maximum distance from the center (i.e., the radius of the window)
+    max_distance = radius_factor * min(center_x, center_y);  % Factor of the image size
+    
+    % Create the radial window using a smooth logistic function
+    window = 1 ./ (1 + exp(decay_rate * (distances - max_distance)));
+    
+    % Apply the window to the image
+    img_windowed = img .* window;
+end
+
+function image_with_wavelet_overlay(img, spec, Scales, scale_idx, angle_idx, clevfactor,ProcessFlag)
+    if ProcessFlag ==1
+        % Normalize img for display
+        img_display = img - min(img(:));  % Shift so that minimum is zero
+        img_display = img_display / max(img_display(:));  % Scale to [0,1]
+
+        imagesc(img_display); colormap(gray); 
+        %colorbar; 
+        axis on
+        hold on
+
+        % Extract the wavelet coefficients at the specified scale and angle
+        wavelet_real = real(spec(:, :, scale_idx, angle_idx));
+        wavelet_abs = abs(spec(:, :, scale_idx, angle_idx));
+
+        % Adjust contour levels based on the data range
+        clevfactor = clevfactor/1.9;
+        
+        max_real = max(abs(wavelet_real(:))) / clevfactor;
+        max_abs = max(wavelet_abs(:)) / clevfactor;
+
+        % Set contour levels for real part
+        posLevels = linspace(0.1 * max_real, max_real, 5);
+        negLevels = -posLevels;
+
+        % Plot contours of the positive real part
+        contour(wavelet_real, 'LevelList', posLevels, 'LineColor', 'red', 'LineWidth', 1);
+
+        % Plot contours of the negative real part
+        contour(wavelet_real, 'LevelList', negLevels, 'LineColor', 'blue', 'LineWidth', 1);
+
+        % Plot contours of the power (magnitude squared)
+        power_levels = linspace(0.1 * max_abs^2, max_abs^2, 5);
+        contour(wavelet_abs.^2, 'LevelList', power_levels, 'LineColor', 'white', 'LineWidth', 1);
+
+        hold off;
+    else
+        % Overlay wavelet power on image
+        image(img); colormap(gray); colorbar; axis on
+        hold on
+
+        posLevels = (1:2:9) / clevfactor;
+        negLevels = (-9:2:-1) / clevfactor;
+
+        % Adjust contour levels by scale as factor
+        sfactor = Scales(scale_idx);
+
+        % Real part is crests and troughs
+        contour(real(spec(:, :, scale_idx, angle_idx)), 'LevelList', posLevels * sfactor, 'EdgeColor', 'red');
+        contour(real(spec(:, :, scale_idx, angle_idx)), 'LevelList', negLevels * sfactor, 'EdgeColor', 'blue');
+
+        % Power is magnitude squared
+        contour((abs(spec(:, :, scale_idx, angle_idx)) * sfactor) .^2, 'EdgeColor', 'white');
+        hold off;
+    end
 end
