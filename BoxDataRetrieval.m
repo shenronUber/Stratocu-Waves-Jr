@@ -1,7 +1,7 @@
 %% Parameters and Setup
 
 % Define access token and base URL
-accessToken = 'MG9Uch8NWvi2dB7ApfoZkVBGCSDtz9lo';  % Replace with your actual developer token
+accessToken = 'KVV5Rxz351vrvDHLm8A26q44tWUgQHye';  % Replace with your actual developer token
 baseURL = 'https://api.box.com/2.0/';
 
 % Set up web options with headers for authorization
@@ -17,12 +17,14 @@ outputVideoFile = 'output_video.mp4';
 
 % Retrieve file list
 %fileList = retrieveFilesForPeriod(rootFolderID, dataFolderName, startDate, endDate, options, baseURL);
+fileList = retrieveAllFilesInFolder(rootFolderID, dataFolderName, options, baseURL);
 
 % Download files
-%downloadFiles(fileList, downloadDir, options, baseURL);
+downloadFiles(fileList, downloadDir, options, baseURL);
+
 %%
 % Only call the video creation function if files are already downloaded
-createVideoFromFiles(downloadDir, 'IR');
+createVideoFromFiles(downloadDir, 'VIS');
 
 %% Functions
 
@@ -72,6 +74,37 @@ function fileList = retrieveFilesForPeriod(rootFolderID, dataType, startDate, en
                     warning('Unexpected timestamp format in file name: %s', fileName);
                 end
 
+            end
+        end
+    end
+end
+
+function fileList = retrieveAllFilesInFolder(rootFolderID, dataType, options, baseURL)
+    % Initialize file list
+    fileList = {};
+
+    % Navigate to the folder for the data type
+    dataFolderID = getFolderIDByName(rootFolderID, dataType, options, baseURL);
+    if isempty(dataFolderID)
+        error('Data type folder "%s" not found in root folder.', dataType);
+    end
+
+    % Get contents of the data folder
+    folderContents = getFolderContents(dataFolderID, options, baseURL);
+    entriesArray = folderContents.entries;  % Array of entry structs
+
+    % Loop through each struct in the entries array
+    for j = 1:numel(entriesArray)
+        entry = entriesArray{j};  % Extract each struct array in entries cell
+
+        % Now loop through the struct array in this entry
+        for i = 1:numel(entry)
+            fileEntry = entry(i);  % Access individual file entry struct
+            
+            if strcmp(fileEntry.type, 'file')
+                % Add the file info directly without any date filter
+                fileInfo = struct('name', fileEntry.name, 'id', fileEntry.id);
+                fileList{end+1} = fileInfo;
             end
         end
     end
@@ -193,36 +226,25 @@ function createVideoFromFiles(downloadDir, dataType)
     [fileTimestamps, sortIdx] = sort(fileTimestamps);
     fileNames = fileNames(sortIdx);
 
-    % Now, process the files depending on dataType
-    if strcmpi(dataType, 'IR')
-        % For IR data, create one video covering the entire time range
-        startTime = datestr(fileTimestamps(1), 'yyyymmddHHMMSS');
-        endTime = datestr(fileTimestamps(end), 'yyyymmddHHMMSS');
-        outputVideoFile = sprintf('IR_%s_%s.mp4', startTime, endTime);
+    % Shift each timestamp to the beginning of the day to get unique dates
+    uniqueDates = unique(dateshift(fileTimestamps, 'start', 'day'));
 
-        % Create video
-        createVideo(fileNames, fileTimestamps, downloadDir, outputVideoFile);
-
-    elseif strcmpi(dataType, 'VIS')
-        % Shift each timestamp to the beginning of the day to get unique dates
-        uniqueDates = unique(dateshift(fileTimestamps, 'start', 'day'));
-        for d = 1:length(uniqueDates)
-            % Find indices where the timestamp matches the current unique date
-            dayFilesIdx = find(dateshift(fileTimestamps, 'start', 'day') == uniqueDates(d));
-            dayFileNames = fileNames(dayFilesIdx);
-            dayFileTimestamps = fileTimestamps(dayFilesIdx);
-            dateStr = datestr(uniqueDates(d), 'yyyymmdd');
-            outputVideoFile = sprintf('VIS_%s.mp4', dateStr);
+    for d = 1:length(uniqueDates)
+        % Find indices where the timestamp matches the current unique date
+        dayFilesIdx = find(dateshift(fileTimestamps, 'start', 'day') == uniqueDates(d));
+        dayFileNames = fileNames(dayFilesIdx);
+        dayFileTimestamps = fileTimestamps(dayFilesIdx);
+        dateStr = datestr(uniqueDates(d), 'yyyymmdd');
         
-            % Create video for this day
-            createVideo(dayFileNames, dayFileTimestamps, downloadDir, outputVideoFile);
-        end
-    else
-        error('Invalid dataType. Must be ''IR'' or ''VIS''.');
+        % Set the output video file name based on date and dataType
+        outputVideoFile = sprintf('%s_%s.mp4', dataType, dateStr);
+        
+        % Create video for this day
+        createVideo(dayFileNames, dayFileTimestamps, downloadDir, outputVideoFile, dataType);
     end
 end
 
-function createVideo(fileNames, fileTimestamps, downloadDir, outputVideoFile)
+function createVideo(fileNames, fileTimestamps, downloadDir, outputVideoFile, dataType)
     % Initialize video writer
     v = VideoWriter(outputVideoFile, 'MPEG-4');
     v.FrameRate = 2;  % Adjust frame rate as needed
@@ -250,14 +272,37 @@ function createVideo(fileNames, fileTimestamps, downloadDir, outputVideoFile)
 
             % Read the selected data
             data = ncread(filePath, variableName);
-
-            % Display the data without any additional elements
-            % Normalize data to the range [0, 1] for image display
             data = double(data);
-            data = (data - min(data(:))) / (max(data(:)) - min(data(:)));
 
-            % Create an RGB image from the grayscale data
-            img = repmat(data', [1, 1, 3]);  % Transpose data to match orientation
+            if strcmpi(dataType, 'VIS')
+                % Calculate the 10th and 99th percentiles of the image intensity.
+                lower_bound = prctile(data(:), 10);
+                upper_bound = prctile(data(:), 99);
+                
+                % Truncate values below the 10th percentile to the lower bound
+                % and values above the 99th percentile to the upper bound.
+                img_processed = data;
+                img_processed(data < lower_bound) = lower_bound;
+                img_processed(data > upper_bound) = upper_bound;
+                
+                % Normalize to the [0, 1] range.
+                img_processed = (img_processed - lower_bound) / (upper_bound - lower_bound);
+                img = repmat(img_processed', [1, 1, 3]);  % Transpose data to match orientation
+            
+            elseif strcmpi(dataType, 'IR')
+                % Set brightness temperature limits
+                lower_bound = 280; % 280 Kelvins
+                upper_bound = 300; % 300 Kelvins
+                
+                % Truncate values below the lower bound and above the upper bound.
+                img_processed = data;
+                img_processed(data < lower_bound) = lower_bound;
+                img_processed(data > upper_bound) = upper_bound;
+                
+                % Normalize to the [0, 1] range.
+                img_processed = (img_processed - lower_bound) / (upper_bound - lower_bound);
+                img = repmat(img_processed', [1, 1, 3]);  % Transpose data to match orientation
+            end
 
             % Write the frame to the video
             writeVideo(v, img);
