@@ -24,7 +24,7 @@ downloadFiles(fileList, downloadDir, options, baseURL);
 
 %%
 % Only call the video creation function if files are already downloaded
-createVideoFromFiles(downloadDir, 'VIS');
+createVideoFromFiles(downloadDir, 'IR');
 
 %% Functions
 
@@ -237,7 +237,7 @@ function createVideoFromFiles(downloadDir, dataType)
         dateStr = datestr(uniqueDates(d), 'yyyymmdd');
         
         % Set the output video file name based on date and dataType
-        outputVideoFile = sprintf('%s_%s', dataType, dateStr);
+        outputVideoFile = sprintf('%s_%s.mp4', dataType, dateStr);
         
         % Create video for this day
         createVideo(dayFileNames, dayFileTimestamps, downloadDir, outputVideoFile, dataType);
@@ -245,10 +245,9 @@ function createVideoFromFiles(downloadDir, dataType)
 end
 
 function createVideo(fileNames, fileTimestamps, downloadDir, outputVideoFile, dataType)
-    % Initialize video writer with Motion JPEG 2000 codec
-    v = VideoWriter(outputVideoFile, 'Motion JPEG 2000');
+    % Initialize video writer
+    v = VideoWriter(outputVideoFile, 'MPEG-4');
     v.FrameRate = 2;  % Adjust frame rate as needed
-    v.LosslessCompression = true; % Enable lossless compression
     open(v);
 
     for i = 1:length(fileNames)
@@ -276,51 +275,43 @@ function createVideo(fileNames, fileTimestamps, downloadDir, outputVideoFile, da
             data = double(data);
 
             if strcmpi(dataType, 'VIS')
-                % Calculate the 10th and 99th percentiles of the image intensity
+                % Calculate the 10th and 99th percentiles of the image intensity.
                 lower_bound = prctile(data(:), 10);
                 upper_bound = prctile(data(:), 99);
-
-                % Truncate and normalize the data
+                
+                % Truncate values below the 10th percentile to the lower bound
+                % and values above the 99th percentile to the upper bound.
                 img_processed = data;
                 img_processed(data < lower_bound) = lower_bound;
                 img_processed(data > upper_bound) = upper_bound;
+                
+                % Normalize to the [0, 1] range.
                 img_processed = (img_processed - lower_bound) / (upper_bound - lower_bound);
-
-                % Create an RGB image by duplicating the grayscale data
                 img = repmat(img_processed', [1, 1, 3]);  % Transpose data to match orientation
-
+            
             elseif strcmpi(dataType, 'IR')
                 % Set brightness temperature limits
                 lower_bound = 280; % 280 Kelvins
-                upper_bound = 292.5; % 292.5 Kelvins
-
-                % Truncate and normalize the data
+                upper_bound = 292.5; % 300 Kelvins
+                
+                % Truncate values below the lower bound and above the upper bound.
                 img_processed = data;
                 img_processed(data < lower_bound) = lower_bound;
                 img_processed(data > upper_bound) = upper_bound;
+                
+                % Normalize to the [0, 1] range.
                 img_processed = (img_processed - lower_bound) / (upper_bound - lower_bound);
 
-                % Invert grayscale for better visualization
+                % Invert grayscale by subtracting from 1
                 img_processed = 1 - img_processed;
-
-                % Create an RGB image by duplicating the grayscale data
+                
                 img = repmat(img_processed', [1, 1, 3]);  % Transpose data to match orientation
+                %figure
+                %imshow(img)
             end
-
-            % Ensure frame dimensions are even
-            [h, w, ~] = size(img);
-            if mod(h, 2) ~= 0
-                img = img(1:end-1, :, :);
-            end
-            if mod(w, 2) ~= 0
-                img = img(:, 1:end-1, :);
-            end
-
-            % Convert the image data from double [0,1] to uint8 [0,255]
-            img_uint8 = uint8(img * 255);
 
             % Write the frame to the video
-            writeVideo(v, img_uint8);
+            writeVideo(v, img);
 
         catch ME
             fprintf('Error processing %s: %s\n', fileName, ME.message);
@@ -331,34 +322,3 @@ function createVideo(fileNames, fileTimestamps, downloadDir, outputVideoFile, da
     close(v);
     fprintf('Video saved to %s\n', outputVideoFile);
 end
-
-
-function plotHistogram(img)
-    % Check if the image has three dimensions
-    if ndims(img) == 3
-        % Assume the image is grayscale with duplicated channels (e.g., RGB)
-        % Extract one channel (all channels should be the same in grayscale)
-        img_gray = img(:, :, 1);
-    else
-        % Image is already grayscale
-        img_gray = img;
-    end
-
-    % Flatten the grayscale image into a vector
-    pixelValues = img_gray(:);
-
-    % Plot the histogram of pixel values (counts)
-    figure;
-    histogram(pixelValues, 256); % 256 bins for 8-bit images
-    xlabel('Pixel Intensity');
-    ylabel('Count');
-    set(gca, 'YScale', 'log')
-    title('Histogram of Pixel Intensities');
-
-    % Optional: Display statistics for debugging
-    fprintf('Min Intensity: %f\n', min(pixelValues));
-    fprintf('Max Intensity: %f\n', max(pixelValues));
-    fprintf('Mean Intensity: %f\n', mean(pixelValues));
-    fprintf('Median Intensity: %f\n', median(pixelValues));
-end
-

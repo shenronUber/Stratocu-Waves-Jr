@@ -1,17 +1,123 @@
-%% Parameters and Setup
+%% NEW PROGRAM : Parameters and Setup
 
 % Start timing the entire process
 total_time = tic;
 
-% Directory containing NetCDF files
-data_dir = 'downloaded_data\VIS';
+% Set path and load images
+path = 'C:\Users\admin\Documents\GitHub\Stratocu-Waves-Jr\DATA\2022_09_06\';
+image_files = dir(fullfile(path, '*9_06*png'));
+images = cell(length(image_files), 1);
+
+% Read and process images
+for i = 1:length(image_files)
+    fname = fullfile(path, image_files(i).name);
+    img = imread(fname);
+    red = flipud(img(:, 400:end, 1));
+    images{i} = red;
+end
+
+% Get image dimensions
+[height, width] = size(images{1});
+x = 0:(width - 1);
+y = 0:(height - 1);
+[X, Y] = meshgrid(x, y);
+
+% Pixel size
+DX = 2000; % meters per pixel
+pixel_size_km = DX / 1000; % kilometers per pixel
+
+% Coordinates in meters
+Xm = (X - mean(X(:))) * DX;
+%Ym = (Y - mean(Y(:))) * DX;
+Ym = (-Y + mean(Y(:))) * DX;
+
+%%
+
+% Wave parameters (first wave)
+cphase = 15;            % m/s
+wavelength = 150e3;     % meters
+direction = 135-180;        % degrees
+zamplitude = 100;       % meters
+PBLdepth = 1000;        % m
+
+% Wavenumbers
+%k = (2 * pi / wavelength) * sin(direction * pi / 180);
+%l = (2 * pi / wavelength) * cos(direction * pi / 180);
+% Corrected wave numbers
+k = (2 * pi / wavelength) * cos(direction * pi / 180); % Now uses cosine
+l = (2 * pi / wavelength) * sin(direction * pi / 180); % Now uses sine
+
+
+% Amplitude modulation (first wave)
+packet_center_x = -400e3;
+packet_center_y = -400e3;
+packet_width_x = 400e3;
+packet_width_y = 300e3;
+
+Ampwindow = exp(-(((Xm - packet_center_x) / packet_width_x).^2 + ...
+                  ((Ym - packet_center_y) / packet_width_y).^2));
+
+% Time parameters
+time_steps = length(images);
+time_resolution = 1800; % seconds between frames
+
+% Initialize the grid to store the synthetic images
+grid = zeros(height, width, time_steps);
+
+% Compute angular frequency
+omega = cphase * (2 * pi / wavelength);
+
+% Corrected phase calculation
+for it = 1:time_steps
+    t = (it - 1) * time_resolution;
+
+    % Corrected phase
+    phase = k * Xm + l * Ym - omega * t;
+
+    % Vertical displacement
+    dz = zamplitude * sin(phase) .* Ampwindow;
+
+    % Horizontal displacements for the first wave
+    dxy = (zamplitude / PBLdepth) * wavelength * sin(phase - pi / 2) / DX;
+
+    % Corrected dx and dy calculations
+    dx = dxy .* cos(direction * pi / 180) .* Ampwindow; % uses cosine
+    dy = dxy .* sin(direction * pi / 180) .* Ampwindow; % uses sine
+
+    % Total displacements
+    total_dx = dx;
+    total_dy = dy;
+
+    % Get the current image
+    img = double(images{it});
+
+    % Coordinates for interpolation
+    XI = X - total_dx;
+    YI = Y - total_dy;
+
+    % Handle boundaries
+    XI = max(min(XI, width), 1);
+    YI = max(min(YI, height), 1);
+
+    % Warp the image
+    warped_img = interp2(X, Y, img, XI, YI, 'linear', 0);
+
+    % Modulate brightness
+    modulated_img = warped_img .* (1 + dz / PBLdepth * 5);
+
+    % Store the synthetic image
+    grid(:, :, it) = modulated_img;
+end
+
+
+%%
 
 % Specify the number of frames to process
 % Set to Inf to process all frames, or specify a number, e.g., 10 for the first 10 frames
 num_frames = 2;
 
 % Get a list of NetCDF files in the directory
-nc_files = dir(fullfile(data_dir, '*.nc'));
+nc_files = dir(fullfile(path, '*9_06*png'));
 
 % Adjust num_frames based on available files
 if num_frames == Inf
@@ -22,26 +128,24 @@ end
 
 % Check if there are enough files to process
 if num_frames < 2
-    error('At least two NetCDF files are required for processing.');
+    error('At least two  files are required for processing.');
 end
 
 % Shrinking factor
-shrinkfactor = 2;
+shrinkfactor = 5;
 invshrinkfactor = 1 / shrinkfactor;
 
 % Dynamic pixel size (km per pixel)
-degrees_per_pixel = 0.04;
-km_per_degree = 111.32; % Average km per degree on Earth's surface
-original_pixel_size_km = degrees_per_pixel * km_per_degree; % Resulting pixel size in km (4.4528 km)
+original_pixel_size_km = 2; % Original pixel size before shrinking
 pixel_size_km = original_pixel_size_km * shrinkfactor; % Adjusted pixel size due to shrinking
 
-% Square size in degrees (does not depend on shrinkfactor)
-square_size_deg = 10; % 5x5 degrees squares
-
-% Calculate square size in km (independent of shrinkfactor)
+% Square size in degrees
+square_size_deg = 5; % 5x5 degrees squares
+% Conversion factor: 1 degree ≈ 111.32 km on Earth's surface
+km_per_degree = 111.32;
+% Calculate square size in km
 square_size_km = square_size_deg * km_per_degree; % Total km per square
-
-% Calculate square size in pixels based on original pixel size
+% Calculate square size in pixels
 square_size_px = round(square_size_km / pixel_size_km);
 
 % Brightness thresholds (adjust as needed)
@@ -55,7 +159,7 @@ Angles = 0:pi/(NANGLES-1):pi;
 % Define scales in km (10 km to 500 km range), but divided by 2 because
 % scales are half the wavelength
 min_scale_km = 10;
-max_scale_km = 500;
+max_scale_km = 100; %500;
 NSCALES=20;
 Scales_km = logspace(log10(min_scale_km), log10(max_scale_km), NSCALES);
 
@@ -77,11 +181,7 @@ Save_Metadata_Flag = 1; % 1 to save metadata, 0 to skip
 %% Read Data and Initialize
 
 % Read the first file to get dimensions
-first_file_path = fullfile(data_dir, nc_files(1).name);
-frame1 = readVariableFromFile(first_file_path);
-
-% Transpose the frame to switch x and y dimensions (portrait orientation)
-frame1 = frame1';
+frame1 = grid(:, :, 1);
 
 % Resize the frame according to the shrink factor if needed
 if shrinkfactor ~= 1
@@ -178,16 +278,13 @@ for frame_idx = 1:num_frames - 1
     % Measure time for processing each frame (optional)
     frame_time = tic; % Start timing for a specific frame
 
-    % Read data from NetCDF files
-    file1_path = fullfile(data_dir, nc_files(frame_idx).name);
-    file2_path = fullfile(data_dir, nc_files(frame_idx + 1).name);
-
-    frame1 = readVariableFromFile(file1_path);
-    frame2 = readVariableFromFile(file2_path);
-
-    % Transpose the frames to switch x and y dimensions (portrait orientation)
-    frame1 = frame1';
-    frame2 = frame2';
+    % Get frames from synthetic data
+    frame1 = grid(:, :, frame_idx);
+    frame2 = grid(:, :, frame_idx + 1);
+    
+    % Convert to double for processing
+    frame1 = double(frame1);
+    frame2 = double(frame2);
 
     % Resize frames according to shrink factor if needed
     if shrinkfactor ~= 1
@@ -299,29 +396,68 @@ fprintf('Total execution time: %.2f seconds.\n', toc(total_time));
 
 %% Analyze the data
 
-plot_waverose(1,22,false,4);
+% Carrés d'intérêt
+
+squares_of_interest = [9, 10, 13, 14];
+target_wavelength = wavelength/1000; % Longueur d'onde cible en km
+target_angle = direction; % Direction en degrés
+
+
+% Filtrer les données pour les carrés d'intérêt
+filtered_data = peak_data(ismember(peak_data(:, 2), squares_of_interest), :);
+
+% Initialiser une liste pour stocker les vitesses proches de la longueur d'onde cible
+speeds_near_target = [];
+angles_near_target = [];
+
+% Boucle sur chaque carré d'intérêt
+for square = squares_of_interest
+    % Extraire les données pour le carré actuel
+    square_data = filtered_data(filtered_data(:, 2) == square, :);
+    
+    % Calculer la différence en valeur absolue entre chaque longueur d'onde et la cible
+    [~, idx] = min(abs(square_data(:, 8) - target_wavelength));
+    
+    % Récupérer la vitesse associée à la longueur d'onde la plus proche de 150 km
+    closest_speed = square_data(idx, 6); % La vitesse est dans la 6ème colonne
+    closest_angle = square_data(idx, 4); % L'angle est dans la 6ème colonne
+    
+    % Ajouter cette vitesse à la liste des vitesses proches de la cible
+    speeds_near_target(end + 1) = closest_speed;
+    angles_near_target(end + 1) = closest_angle;
+
+
+end
+
+% Calculer la vitesse moyenne
+average_speed = mean(speeds_near_target);
+average_angle = 180*mean(angles_near_target)/pi;
+
+
+% Afficher le résultat
+fprintf('La vitesse moyenne pour les carrés %s proche de la longueur d''onde de %.2f km est : %.2f m/s\n', ...
+        num2str(squares_of_interest), target_wavelength,average_speed);
+
+fprintf('L''angle moyen pour les carrés  %s proche de la longueur d''onde de %.2f  km est : %.2f °\n', ...
+        num2str(squares_of_interest), target_wavelength, average_angle);
+
+% Calculer la différence en valeur absolue entre chaque longueur d'onde et la cible
+[~, scale_idx] = min(abs(Scales_km*2 - target_wavelength));
+target_angle_rad = mod((target_angle) * pi / 180, pi); % Ramener dans [0, pi[ 
+[~, angle_idx] = min(abs(Angles - target_angle_rad));
+
+%%
+
+power_spectrum_2D = get_power_spectrum(cwt1_full, scale_idx, angle_idx, Scales_km, Angles,frame1_windowed,0.4);
+
+% for i=1:length(Angles)
+%     power_spectrum_2D = get_power_spectrum(cwt1_full, scale_idx, i, Scales_km, Angles,frame1_windowed,0.8);
+% end
+%plot_waverose(1,91,false,4);
+
+power_wave_rose(cwt1_full, Scales_km, Angles,length(Scales_km))
 
 %% Supporting Functions
-
-function data = readVariableFromFile(filePath)
-    % Read the appropriate variable ('CMI' or 'Rad') from a NetCDF file
-    info = ncinfo(filePath);
-    variables = {info.Variables.Name};
-
-    if any(strcmp(variables, 'CMI'))
-        variableName = 'CMI';
-    elseif any(strcmp(variables, 'Rad'))
-        variableName = 'Rad';
-    else
-        % List all available variables in the file for reference
-        warning('No suitable variable found in file %s. Available variables: %s.', ...
-                filePath, strjoin(variables, ', '));
-        error('No suitable variable to read.');
-    end
-
-    % Read the selected data
-    data = ncread(filePath, variableName);
-end
 
 function img_processed = preprocess_img(img)
     % Preprocess the image by truncating intensity values to reduce contrast.
@@ -344,7 +480,8 @@ function peak_list = find_peaks_and_speeds(coherence, phase_difference, Scales, 
     % Initialize peak_list to collect data for each scale
     num_scales = length(Scales);
     peak_list = zeros(num_scales, 6); % Columns: [Scale; Angle; MeanPhaseDiff; Speed_m_per_s; CoherenceValue; Wavelength_km]
-
+    
+    
     % Loop over each scale
     for scale_idx = 1:num_scales
         % Extract coherence at the current scale across all angles
@@ -355,7 +492,7 @@ function peak_list = find_peaks_and_speeds(coherence, phase_difference, Scales, 
         [max_coherence_value, angle_idx] = max(coherence_scale);
 
         % Get the corresponding angle
-        angle = Angles(angle_idx);
+        angle_target = Angles(angle_idx);
 
         % Extract the phase difference and coherence slices at this scale and angle
         phase_slice = phase_difference(:, :, scale_idx, angle_idx);
@@ -373,12 +510,14 @@ function peak_list = find_peaks_and_speeds(coherence, phase_difference, Scales, 
 
         % Calculate speed
         %wavelength_km = Scales(scale_idx) * 2 * pixel_size_km;  % Wavelength in km
-        wavelength_km = Scales(scale_idx) * pi/sqrt(2) * pixel_size_km;  % Wavelength in km
+        wavelength_km = (pi * Scales(scale_idx) * pixel_size_km) / sqrt(2);
         distance_shift_km = (mean_phase_diff * wavelength_km) / (2 * pi);
         speed_m_per_s = (distance_shift_km / time_interval) * 1000;  % Convert km/s to m/s
+        % Adjust the speed based on the angle
+        %speed_m_per_s = speed_m_per_s * cos(angle_target);
 
         % Store data
-        peak_list(scale_idx, :) = [Scales(scale_idx), angle, mean_phase_diff, speed_m_per_s, max_coherence_value, wavelength_km];
+        peak_list(scale_idx, :) = [Scales(scale_idx), angle_target, mean_phase_diff, speed_m_per_s, max_coherence_value, wavelength_km];
     end
 end
 
@@ -975,5 +1114,159 @@ function image_with_wavelet_overlay(img, spec, Scales, scale_idx, angle_idx, cle
 
     contour(wavelet_abs.^2, 'LevelList', power_levels, 'LineColor', 'white', 'LineWidth', 1);
 
+    hold off;
+end
+
+function power_spectrum_2D = get_power_spectrum(cwt1_full, scale_idx, angle_idx, Scales, Angles, frame, intensity_threshold)
+    % get_power_spectrum - Retourne la carte 2D du spectre de puissance pour une échelle et un angle donnés, et superpose les contours d'intensité élevée sur l'image d'origine en niveaux de gris.
+    %
+    % Syntaxe : power_spectrum_2D = get_power_spectrum(cwt1_full, scale_idx, angle_idx, Scales, Angles, frame, intensity_threshold)
+    %
+    % Entrées :
+    %   cwt1_full         - Coefficients de la transformée en ondelettes continues en 2D (format 4D)
+    %   scale_idx         - Indice de l'échelle (scale) sélectionnée
+    %   angle_idx         - Indice de l'angle sélectionné
+    %   Scales            - Vecteur des échelles en km correspondant à chaque index d'échelle
+    %   Angles            - Vecteur des angles en degrés correspondant à chaque index d'angle
+    %   frame             - Image originale à utiliser comme fond pour la superposition
+    %   intensity_threshold - Seuil d'intensité pour afficher les contours (en pourcentage, par exemple 0.8 pour 80%)
+    %
+    % Sorties :
+    %   power_spectrum_2D - Carte 2D du spectre de puissance pour l'échelle et l'angle sélectionnés
+
+    % Convertir les scales en wavelength
+    Scales=2*Scales;
+
+    % Extraire la carte de coefficients pour l'échelle et l'angle donnés
+    wavelet_coeffs = squeeze(cwt1_full.cfs(:, :, :, scale_idx, angle_idx));
+
+    % Calculer le spectre de puissance (magnitude au carré des coefficients)
+    power_spectrum_2D = abs(wavelet_coeffs).^2;
+
+    % Appliquer un seuil pour ne conserver que les intensités élevées
+    max_intensity = max(power_spectrum_2D(:));
+    threshold_value = intensity_threshold * max_intensity;
+
+    % Afficher l'image originale en niveaux de gris
+    figure;
+    imshow(frame, [], 'InitialMagnification', 'fit');
+    colormap(gray);
+    hold on;
+
+    % Superposer les contours de haute intensité
+    contour(power_spectrum_2D, [threshold_value threshold_value], 'LineColor', 'r', 'LineWidth', 1.5);
+
+    % Valeurs réelles d'échelle (en km) et d'angle (en degrés)
+    real_scale_km = Scales(scale_idx);
+    real_angle_deg = Angles(angle_idx) * (180 / pi);
+
+    % Ajouter des éléments de couleur et de texte
+    colorbar;
+    title(sprintf('Contours de haute intensité du spectre de puissance 2D\nÉchelle: %.2f km, Angle: %.2f°', real_scale_km, real_angle_deg));
+    xlabel('X (pixels)');
+    ylabel('Y (pixels)');
+    axis tight;
+    hold off;
+end
+
+function power_wave_rose(cwt, Scales, Angles, Scales_length)
+    % power_wave_rose - Trace la rose des puissances à partir de la transformée en ondelettes continues 2D
+    %
+    % Syntaxe : power_wave_rose(cwt, Scales, Angles, pixel_size_km)
+    %
+    % Entrées :
+    %   cwt           - Structure retournée par cwtft2 contenant les coefficients d'ondelettes (cwt.cfs)
+    %   Scales        - Tableau des échelles utilisées dans la transformée en ondelettes
+    %   Angles        - Tableau des angles utilisés dans la transformée en ondelettes (en radians)
+    %   pixel_size_km - Taille du pixel en kilomètres (pour convertir les échelles en km)
+    %
+    % Sorties :
+    %   Une figure représentant la rose des puissances en fonction de l'échelle et de l'angle
+
+    % Convertir les scales en wavelength
+    Scales=2*Scales;
+
+    % Calculer le spectre de puissance (magnitude au carré des coefficients)
+    cwt=squeeze(cwt.cfs(:,:,:,1:Scales_length,:));
+    
+    
+    power_spectrum = abs(cwt).^2;
+    
+    % Moyenne sur les dimensions spatiales (y et x)
+    avg_power = squeeze(mean(mean(power_spectrum, 1, 'omitnan'), 2, 'omitnan'));
+    avg_power = squeeze(avg_power);  % Taille : (nombre_d'échelles, nombre_d'angles)
+    
+    % Calculer la puissance moyenne par échelle pour normalisation
+    mean_power_byscale = mean(avg_power, 2);
+    
+    % Normaliser la puissance en fonction de la moyenne par échelle
+    anglespec_power = avg_power ./ mean_power_byscale;
+    
+    % Étendre les angles pour couvrir 0 à 2*pi
+    Angles_extended = [Angles, mod(Angles + pi, 2*pi)];
+    % Étendre les puissances normalisées en conséquence
+    anglespec_power_extended = [anglespec_power, anglespec_power];
+    
+    % Trier les angles et réorganiser les puissances normalisées
+    [Angles_full, sort_idx] = sort(Angles_extended);
+    avg_power_full = anglespec_power_extended(:, sort_idx);
+
+
+    % Créer une grille pour les angles et les échelles
+    [Theta, R] = meshgrid(Angles_full, Scales(1:Scales_length));
+
+    % Convertir les coordonnées polaires en coordonnées cartésiennes
+    [X, Y] = pol2cart(Theta, R);
+
+    % Tracer le spectre de puissance en coordonnées polaires
+    figure;
+    p = pcolor(X, Y, avg_power_full);
+    p.EdgeColor = 'none';  % Enlever les lignes de grille
+    shading interp;
+    colormap jet;
+    colorbar;
+    title('Rose des Puissances');
+    xlabel('X (km)');
+    ylabel('Y (km)');
+    axis equal;
+    axis off; % Optionnel : cacher les axes pour une meilleure présentation
+
+    % Ajouter des cercles radiaux pour les échelles
+    hold on;
+    max_scale = max(Scales);
+    % Convertir les échelles en km
+    %pixel_size_km = 2 ; % penser à changer si jamais c'est pas pareil
+    scales_km = Scales;
+
+    % Sélectionner quelques échelles pour les étiquettes (par exemple, 5 échelles)
+    num_radii = 10;
+    radii_indices = round(linspace(1, length(scales_km), num_radii));
+    radii_to_label = scales_km(radii_indices);
+    scales_to_plot = Scales(radii_indices);
+
+    for idx = 1:length(scales_to_plot)
+        r = scales_to_plot(idx);
+        theta_circle = linspace(0, 2*pi, 360);
+        x_circle = r * cos(theta_circle);
+        y_circle = r * sin(theta_circle);
+        plot(x_circle, y_circle, 'k--');  % Cercles en pointillés noirs
+        % Ajouter des étiquettes pour les échelles (rayons) en km
+        label_radius = r * 1.02;
+        text(label_radius * cos(pi/4), label_radius * sin(pi/4), sprintf('%.1f km', radii_to_label(idx)), 'HorizontalAlignment', 'left', 'FontSize', 10);
+    end
+
+    % Ajouter des lignes pour les angles principaux
+    angles_deg = 0:30:330;  % Tous les 30 degrés
+    angles_rad = angles_deg * pi / 180;
+
+    for i = 1:length(angles_rad)
+        theta = angles_rad(i);
+        x_line = [0, (max_scale + max_scale * 0.05) * cos(theta)];
+        y_line = [0, (max_scale + max_scale * 0.05) * sin(theta)];
+        plot(x_line, y_line, 'k--');
+        % Ajouter des étiquettes pour les angles en degrés
+        label_radius = max_scale + max_scale * 0.1;
+        text(label_radius * cos(theta), label_radius * sin(theta), sprintf('%d°', angles_deg(i)), 'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', 'FontSize', 10);
+    end
     hold off;
 end

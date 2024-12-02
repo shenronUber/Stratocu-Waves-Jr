@@ -887,7 +887,8 @@ function plot_waverose(frame_id, square_id)
 
         % Calculate the wavelength in km
         % Since scale is half the wavelength in pixels, and each pixel is pixel_size_km
-        wavelength_km = scale * 2 * pixel_size_km;
+        %wavelength_km = scale * 2 * pixel_size_km;
+        wavelength_km = scale * pi/sqrt(2) * pixel_size_km;
 
         % Calculate the distance shift in km
         distance_shift_km = mean_phase_difference * wavelength_km / (2 * pi);
