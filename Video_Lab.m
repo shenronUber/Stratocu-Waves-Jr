@@ -227,23 +227,41 @@ function img_processed = normalizeDataNaN(data)
 end
 
 function img_processed = applyHighPass(data, filterWidth, doSqrtEnhance)
-    % High-pass filter the data
+    % APPLYHIGHPASS applies a high-pass filter to the input data.
+    %
+    % INPUTS:
+    %   - data: The 2D matrix of input data (e.g., infrared image data)
+    %   - filterWidth: The Gaussian filter width for the low-pass operation
+    %   - doSqrtEnhance: Boolean, whether to apply square root contrast enhancement
+    %
+    % OUTPUT:
+    %   - img_processed: The processed and normalized image ready for visualization
+
+    % Step 1: Apply Gaussian low-pass filter
     lowPass = imgaussfilt(data, filterWidth);
+
+    % Step 2: Compute the high-pass filtered data
     highPass = data - lowPass;
 
-    % Optionally steepen contrast around zero using sqrt filtering
+    % Step 3: Apply square root contrast enhancement (optional)
     if doSqrtEnhance
+        % Enhance contrast near zero while preserving sign
         highPass = sqrt(abs(highPass)) .* sign(highPass);
     end
 
-    % Normalize using percentiles to avoid outliers
-    minVal = prctile(highPass(:), 1);
-    maxVal = prctile(highPass(:), 99);
-    img_processed = highPass;
-    img_processed(img_processed < minVal) = minVal;
-    img_processed(img_processed > maxVal) = maxVal;
-    img_processed = (img_processed - minVal) / (maxVal - minVal);
+    % Step 4: Clip the high-pass values to a tight grayscale range
+    % Default clipping range: [-3, 3] (adjust as needed)
+    clipMin = -3; % Minimum bound for clipping
+    clipMax = 3;  % Maximum bound for clipping
+    highPass(highPass < clipMin) = clipMin;
+    highPass(highPass > clipMax) = clipMax;
 
-    % Invert grayscale (color inversion)
+    % Step 5: Normalize the clipped data to [0, 1] for visualization
+    img_processed = (highPass - clipMin) / (clipMax - clipMin);
+
+    % Step 6: Apply grayscale inversion for better visualization
     img_processed = 1 - img_processed;
+
+    % Output is a normalized and inverted high-pass processed image
 end
+

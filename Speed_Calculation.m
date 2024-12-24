@@ -36,7 +36,7 @@ Ym = (-Y + mean(Y(:))) * DX;
 % Wave parameters (first wave)
 cphase = 15;            % m/s
 wavelength = 150e3;     % meters
-direction = 135-180;        % degrees
+direction = 235;        % degrees
 zamplitude = 100;       % meters
 PBLdepth = 1000;        % m
 
@@ -752,7 +752,7 @@ ylim(ax1, [min(Y_neg(:)) - 1, max(Y_pos(:)) + 1]);
 
 %% Add Radial Rings and Angle Labels
 % Add radial rings corresponding to scales (in km)
-wavelengths_km = Scales * 2 * pixel_size_km; % Convert scales to wavelengths in km
+wavelengths_km = Scales * pi/sqrt(2) * pixel_size_km; % Convert scales to wavelengths in km
 ring_radii = Scales;
 for i = 1:length(ring_radii)
     theta_ring = linspace(0, 2 * pi, 100);
@@ -861,7 +861,7 @@ for fig_num = 1:num_figures
         angle_str = pi_fractions{angle_fraction_idx};  % Get the corresponding fraction of pi string
         
         % Set title with scale and angle in fractions of pi
-        wavelength_km = real_scale * 2 * pixel_size_km;
+        wavelength_km = real_scale * pi * pixel_size_km/sqrt(2);
         title(sprintf('Wavelength: %.1f km, Angle: %s', wavelength_km, angle_str));
         
         % Customize the colorbar
@@ -924,7 +924,7 @@ for fig_num = 1:num_figures
         contour(coherence_mask, [1 1], 'r', 'LineWidth', 1);  % Red contour at mask boundary
         
         % Set title with scale and angle in fractions of pi
-        wavelength_km = real_scale * 2 * pixel_size_km;
+        wavelength_km = real_scale * pi * pixel_size_km/sqrt(2);
         title(sprintf('Wavelength: %.1f km, Angle: %s', wavelength_km, angle_str));
         
         % Customize the colorbar to display ticks from -pi to pi
@@ -989,7 +989,7 @@ for fig_num = 1:num_figures
         hold off;
         
         % Set title with scale and angle
-        wavelength_km = real_scale * 2 * pixel_size_km;
+        wavelength_km = real_scale * pi * pixel_size_km/sqrt(2);
         title(sprintf('Wavelength: %.1f km, Angle: %.2f°', wavelength_km, real_angle * (180/pi)));
         
         % Ensure axis is equal and tight
@@ -1013,7 +1013,7 @@ for i = 1:num_peaks
     mean_phase_difference = peak_list(i,3);  % Mean phase difference in radians
     
     % Calculate the wavelength in km
-    wavelength_km = scale * 2 * pixel_size_km;
+    wavelength_km = scale * pi * pixel_size_km/sqrt(2);
     
     % Calculate the distance shift in km
     distance_shift_km = mean_phase_difference * wavelength_km / (2 * pi);

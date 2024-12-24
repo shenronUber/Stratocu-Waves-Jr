@@ -99,7 +99,7 @@ original_pixel_size_km = degrees_per_pixel * km_per_degree; % Resulting pixel si
 pixel_size_km = original_pixel_size_km * shrinkfactor; % Adjusted pixel size after shrinking
 
 % Square size (5x5 degrees)
-square_size_deg = 10; 
+square_size_deg = 5; 
 square_size_km = square_size_deg * km_per_degree; % Total km per square
 square_size_px = round(square_size_km / pixel_size_km);
 
