@@ -61,16 +61,22 @@ for i = 1:length(fileNames)
     fprintf('Processing %s with method %s...\n', fileName, methodName);
     try
         data = double(ncread(filePath, variableName));
-        
+
         % Replace NaNs with zero and print how many
         nanCount = sum(isnan(data(:)));
         if nanCount > 0
             fprintf('Replacing %d NaNs in %s\n', nanCount, fileName);
-            data(isnan(data)) = 0;
         end
-        
-        data_preprocessed = preprocessData(data);
-        img_processed = processDataMethod(data_preprocessed, methodName);
+    
+        threshold = prctile(data(:), 5);
+        data(data < threshold) = NaN;
+        nan_mask = isnan(data);
+        data(isnan(data)) = mean(data,'all','omitnan');
+    
+        % Processing chain
+        img_processed = processDataMethod(data, methodName);
+        img_processed(nan_mask')=prctile(img_processed(:), 50);
+
         processedFrames{i} = img_processed; % single-channel 2D array
     catch ME
         fprintf('Error processing %s: %s\n', fileName, ME.message);
@@ -332,8 +338,10 @@ for frame_idx = 1:(num_frames - 1)
     frame_time = tic;
     
     % Charger la CWT du frame_idx et frame_idx+1 PARTIELLEMENT
-    spec1_full = mf.cwtFullDataMerged{frame_idx};      % 4D array: (y, x, scale, angle)
-    spec2_full = mf.cwtFullDataMerged{frame_idx + 1};  % idem
+    spec1_full = mf.cwtFullDataMerged(frame_idx, 1); % Accéder à la cellule
+    spec1_full = spec1_full{1}; % 4D array: (y, x, scale, angle)
+    spec2_full = mf.cwtFullDataMerged(frame_idx+1, 1); % Accéder à la cellule
+    spec2_full = spec2_full{1}; % Extraire les données 4D complexes
     
     % Charger l'image fenêtrée (frame_idx) pour les tests brightness
     img1 = processedFrames{frame_idx};
@@ -406,7 +414,7 @@ peak_data = peak_data(1:entry_counter, :);
 fprintf('Total execution time: %.2f seconds.\n', toc(total_time));
 
 %% (Optionally) Analyze the data
-plot_waverose(12,15,false,4,"allSpecData.mat", processedFrames, squares, ...
+plot_waverose(13,16,false,4,"allSpecData.mat", processedFrames, squares, ...
     Scales, Angles, pixel_size_km, time_interval, ...
     shrinkfactor, invshrinkfactor, Preprocess_Flag, ...
     radius_factor, decay_rate, ...
@@ -528,8 +536,11 @@ end
 %% 2) Charger les CWT depuis le matfile
 mf = matfile(waveletMatFileName, 'Writable', false);
 % On suppose qu'il y a cwtFullDataMerged dans ce fichier
-spec1_full = mf.cwtFullDataMerged{frame_id};
-spec2_full = mf.cwtFullDataMerged{frame_id + 1};
+spec1_full = mf.cwtFullDataMerged(frame_id, 1); % Accéder à la cellule
+spec1_full = spec1_full{1}; % 4D array: (y, x, scale, angle)
+spec2_full = mf.cwtFullDataMerged(frame_id+1, 1); % Accéder à la cellule
+spec2_full = spec2_full{1}; % Extraire les données 4D complexes
+
 % spec1_full, spec2_full : (Ny, Nx, Nscales, Nangles)
 
 %% 3) Récupérer et prétraiter les frames 2D (pour test luminosité)
@@ -616,25 +627,331 @@ end
 peak_list = find_peaks_and_speeds(coherence, phase_difference, ...
     Scales, Angles, pixel_size_km, time_interval);
 
-%% 7) Plot de la rose (idem code original)
-% Idem, on reprend tout le code de génération de la rose polaire,
-% overlays, etc.
+%% Plot Advanced Rose Plot
+% Generate the advanced rose plot with power and coherence
+% Overlay the peaks on the plot
 
-% -----------------------------------------------------------------------
-% ... (on recopie la partie "Plot Advanced Rose Plot" etc.)
-% -----------------------------------------------------------------------
+% Calculate inner power and coherence for plotting
+buffer = 0; % Adjust buffer as needed
+innerpower = squeeze(mean(mean(power1(buffer+1:end-buffer, buffer+1:end-buffer, :, :), 1, 'omitnan'), 2, 'omitnan')); % (num_scales x num_angles)
+innercoherence = squeeze(mean(mean(coherence(buffer+1:end-buffer, buffer+1:end-buffer, :, :), 1, 'omitnan'), 2, 'omitnan')); % (num_scales x num_angles)
 
-figure;  % etc.
+% Normalize power and coherence by scale (already done in the previous step)
+% mean_power_byscale = mean(innerpower, 2);
+% mean_coherence_byscale = mean(innercoherence, 2);
+% 
+% anglespec_power = innerpower ./ mean_power_byscale;
+% anglespec_coherence = innercoherence ./ mean_coherence_byscale;
 
-% [NB: Dans l’exemple ici, je mets juste un commentaire. 
-%  Tu peux copier/coller l’intégralité du code de tracé que tu avais,
-%  en conservant la logique de "anglespec_power" / "anglespec_coherence" etc.,
-%  puisque rien ne change, hormis le fait que la CWT est déjà chargée, 
-%  au lieu d’être recalculée localement.]
+anglespec_power = innerpower ;
+anglespec_coherence = innercoherence;
 
-% -----------------------------------------------------------------------
-% Idem pour "Coherence Maps", "Phase Difference Maps", etc.
-% ...
+% Define angles for upper and lower halves
+Angles_pos = Angles;
+Angles_neg = Angles + pi;
+
+% Prepare data for plotting
+[Theta_pos, R_pos] = meshgrid(Angles_pos, Scales);
+[X_pos, Y_pos] = pol2cart(Theta_pos, R_pos);
+
+[Theta_neg, R_neg] = meshgrid(Angles_neg, Scales);
+[X_neg, Y_neg] = pol2cart(Theta_neg, R_neg);
+
+% Plot the advanced rose plot
+figure;
+% Plot power (upper half)
+ax1 = axes;
+pcolor(ax1, X_pos, Y_pos, anglespec_power);
+shading interp;
+colormap(ax1, 'parula');
+axis equal;
+set(ax1, 'Position', [0.1, 0.1, 0.75, 0.75]);
+ax1.XTick = [];
+ax1.YTick = [];
+hold on;
+
+% Plot coherence (lower half)
+ax2 = axes;
+pcolor(ax2, X_neg, Y_neg, anglespec_coherence);
+shading interp;
+colormap(ax2, 'autumn');
+axis equal;
+set(ax2, 'Position', [0.1, 0.1, 0.75, 0.75]);
+ax2.XTick = [];
+ax2.YTick = [];
+set(ax2, 'Color', 'none');
+linkaxes([ax1, ax2]);
+hold on;
+
+% Overlay peaks on the coherence plot
+if ~isempty(peak_list)
+    % Since peak_list is now (num_scales x 8)
+    max_scales = peak_list(:,1); % Scales
+    max_angles = peak_list(:,2) + pi;  % Adjust angles for lower half
+    [peak_X, peak_Y] = pol2cart(max_angles, max_scales);
+    plot(ax2, peak_X, peak_Y, 'k*', 'MarkerSize', 10);
+    % Annotate peaks with speeds 
+    for i = 1:length(peak_X)
+        % Display speed in m/s
+        text(ax2, peak_X(i) * 1.05, peak_Y(i) * 1.05, sprintf('%.1f m/s', peak_list(i, 4)), 'Color', 'k', 'FontSize', 10);
+    end
+end
+
+% Adjust axes limits
+xlim(ax1, [min(X_pos(:)) - 1, max(X_pos(:)) + 1]);
+ylim(ax1, [min(Y_neg(:)) - 1, max(Y_pos(:)) + 1]);
+
+%% Add Radial Rings and Angle Labels
+% Add radial rings corresponding to scales (in km)
+wavelengths_km = Scales * pi/sqrt(2) * pixel_size_km; % Convert scales to wavelengths in km
+ring_radii = Scales;
+for i = 1:length(ring_radii)
+    theta_ring = linspace(0, 2 * pi, 100);
+    [x_ring, y_ring] = pol2cart(theta_ring, ring_radii(i));
+    plot(ax1, x_ring, y_ring, 'k--');
+    plot(ax2, x_ring, y_ring, 'k--');
+    % Add scale labels in km
+    text(ax1, ring_radii(i) * 1.05, 0, sprintf('%.1f km', wavelengths_km(i)), 'HorizontalAlignment', 'left');
+end
+
+% Add angle lines and labels
+angle_ticks = linspace(0, 2 * pi, 13);  % Every 30 degrees
+angle_labels = {'0', '\pi/6', '\pi/3', '\pi/2', '2\pi/3', '5\pi/6', '\pi', '7\pi/6', '4\pi/3', '3\pi/2', '5\pi/3', '11\pi/6', '2\pi'};
+for i = 1:length(angle_ticks)
+    angle_rad = angle_ticks(i);
+    x_line = [0, max(Scales) * cos(angle_rad)];
+    y_line = [0, max(Scales) * sin(angle_rad)];
+    plot(ax1, x_line, y_line, 'k--');
+    plot(ax2, x_line, y_line, 'k--');
+    text(ax1, x_line(2) * 1.1, y_line(2) * 1.1, angle_labels{i}, 'HorizontalAlignment', 'center');
+end
+
+%% Add Colorbars
+original_pos = get(ax1, 'Position');
+c1 = colorbar(ax1, 'eastoutside');
+c1_pos = get(c1, 'Position');
+c1_pos(1) = c1_pos(1) + 0.05;
+set(c1, 'Position', c1_pos);
+set(ax1, 'Position', original_pos);
+ylabel(c1, 'Power');
+
+original_pos = get(ax2, 'Position');
+c2 = colorbar(ax2, 'westoutside');
+c2_pos = get(c2, 'Position');
+c2_pos(1) = c2_pos(1) - 0.05;
+set(c2, 'Position', c2_pos);
+set(ax2, 'Position', original_pos);
+ylabel(c2, 'Coherence');
+
+%% Set Titles
+sgtitle(sprintf('Advanced Rose Plot for Frame %d and Square %d', frame_id, square_id));
+
+%% Additional Plots: Coherence Maps and Phase Difference Maps
+
+% Define common fractions of pi for displaying angles
+pi_fractions = {'0', '\pi/6', '\pi/4', '\pi/3', '\pi/2', '2\pi/3', '\pi', '4\pi/3', '3\pi/2', '2\pi'};
+pi_fraction_values = [0, pi/6, pi/4, pi/3, pi/2, 2*pi/3, pi, 4*pi/3, 3*pi/2, 2*pi];
+
+% Preallocate a cell array to store coherence masks
+coherence_masks = cell(size(peak_list,1),1);
+
+% Plot coherence with mask for each scale
+num_peaks = size(peak_list, 1);
+
+% Calculate the number of figures needed based on figs_per_page
+num_figures = ceil(num_peaks / figs_per_page);
+current_peak = 1;
+
+for fig_num = 1:num_figures
+    figure;
+    num_subplots = min(figs_per_page, num_peaks - (fig_num - 1) * figs_per_page);
+    ncols = ceil(sqrt(num_subplots));
+    nrows = ceil(num_subplots / ncols);
+    
+    for subplot_idx = 1:num_subplots
+        i = current_peak;
+        
+        % Extract the real scale and angle from the peak_list
+        real_scale = peak_list(i,1);  % Scale from peak_list
+        real_angle = peak_list(i,2);  % Angle from peak_list
+        
+        % Find the index of the closest scale in the Scales array
+        [~, scale_idx] = min(abs(Scales - real_scale));
+        
+        % Adjust real_angle if necessary (wrap around)
+        real_angle = mod(real_angle, 2*pi);
+        
+        % Find the index of the closest angle in the Angles array
+        [~, angle_idx] = min(abs(Angles - real_angle));
+        
+        % Extract the corresponding coherence slice for the current scale and angle
+        coherence_slice = coherence(:, :, scale_idx, angle_idx);
+        
+        % Define the threshold for the top 60% of the max coherence value
+        coherence_max = max(coherence_slice(:));
+        coherence_threshold = 0.6 * coherence_max;
+        
+        % Create the mask where coherence is above the threshold
+        coherence_mask = coherence_slice >= coherence_threshold;
+        
+        % Store the mask in the cell array
+        coherence_masks{i} = coherence_mask;  % Store mask for later use
+        
+        % Plot the coherence using imagesc
+        subplot(nrows, ncols, subplot_idx);  % Subplot for multiple plots
+        imagesc(coherence_slice);
+        hold on;
+        % Overlay the contour of the coherence mask
+        contour(coherence_mask, [1 1], 'r', 'LineWidth', 1);  % Red contour at mask boundary
+        
+        % Ensure axis is tight
+        axis tight;
+        
+        % Convert the real_angle to a fraction of pi for the title
+        [~, angle_fraction_idx] = min(abs(pi_fraction_values - real_angle));  % Find closest pi fraction
+        angle_str = pi_fractions{angle_fraction_idx};  % Get the corresponding fraction of pi string
+        
+        % Set title with scale and angle in fractions of pi
+        wavelength_km = real_scale * pi/sqrt(2) * pixel_size_km;
+        title(sprintf('Wavelength: %.1f km, Angle: %s', wavelength_km, angle_str));
+        
+        % Customize the colorbar
+        colorbar;
+        
+        % Set axis equal for consistent plotting
+        axis equal;
+        hold off;
+        
+        current_peak = current_peak + 1;
+    end
+    
+    sgtitle('Coherence with Mask for Each Scale/Angle Peak');
+end
+
+%% Plot Phase Difference with Masked Values and Compute Mean
+current_peak = 1;
+for fig_num = 1:num_figures
+    figure;
+    num_subplots = min(figs_per_page, num_peaks - (fig_num - 1) * figs_per_page);
+    ncols = ceil(sqrt(num_subplots));
+    nrows = ceil(num_subplots / ncols);
+    
+    for subplot_idx = 1:num_subplots
+        i = current_peak;
+        
+        % Extract the real scale and angle from the peak_list
+        real_scale = peak_list(i,1);  % Scale from peak_list
+        real_angle = peak_list(i,2);  % Angle from peak_list
+        
+        % Find the index of the closest scale in the Scales array
+        [~, scale_idx] = min(abs(Scales - real_scale));
+        
+        % Adjust real_angle if necessary (wrap around)
+        real_angle = mod(real_angle, 2*pi);
+        
+        % Find the index of the closest angle in the Angles array
+        [~, angle_idx] = min(abs(Angles - real_angle));
+        
+        % Convert the real_angle to a fraction of pi for the title
+        [~, angle_fraction_idx] = min(abs(pi_fraction_values - real_angle));  % Find closest pi fraction
+        angle_str = pi_fractions{angle_fraction_idx};  % Get the corresponding fraction of pi string
+        
+        % Extract the corresponding phase_difference slice for the current scale and angle
+        phase_slice = phase_difference(:, :, scale_idx, angle_idx);
+        
+        % Retrieve the corresponding mask from coherence_masks
+        coherence_mask = coherence_masks{i};
+        
+        % Apply the mask from coherence to the phase slice
+        phase_masked = phase_slice;
+        phase_masked(~coherence_mask) = NaN;  % Set non-coherent areas to NaN
+        
+        % Plot the phase_difference using imagesc
+        subplot(nrows, ncols, subplot_idx);  % Subplot for multiple plots
+        imagesc(phase_masked);
+        hold on;
+        
+        % Overlay the contour of the coherence mask
+        contour(coherence_mask, [1 1], 'r', 'LineWidth', 1);  % Red contour at mask boundary
+        
+        % Set title with scale and angle in fractions of pi
+        wavelength_km = real_scale * pi/sqrt(2) * pixel_size_km;
+        title(sprintf('Wavelength: %.1f km, Angle: %s', wavelength_km, angle_str));
+        
+        % Customize the colorbar to display ticks from -pi to pi
+        c = colorbar;
+        caxis([-pi pi]);  % Set color axis limits from -pi to pi
+        set(c, 'Ticks', [-pi, -pi/2, 0, pi/2, pi], 'TickLabels', {'-\pi', '-\pi/2', '0', '\pi/2', '\pi'});
+        
+        % Set axis equal for consistent plotting
+        axis equal;
+        axis tight;
+        
+        hold off;
+        
+        current_peak = current_peak + 1;
+    end
+    
+    sgtitle('Phase Difference with Masked Regions for Each Scale/Angle Peak');
+end
+
+%% Additional Plot: Overlay Wavelet Contours on the Image Zoomed into the Square
+current_peak = 1;
+for fig_num = 1:num_figures
+    figure;
+    num_subplots = min(figs_per_page, num_peaks - (fig_num - 1) * figs_per_page);
+    ncols = ceil(sqrt(num_subplots));
+    nrows = ceil(num_subplots / ncols);
+    
+    for subplot_idx = 1:num_subplots
+        i = current_peak;
+        
+        % Extract the real scale and angle from the peak_list
+        real_scale = peak_list(i,1);  % Scale from peak_list
+        real_angle = peak_list(i,2);  % Angle from peak_list
+        
+        % Find the index of the closest scale in the Scales array
+        [~, scale_idx] = min(abs(Scales - real_scale));
+        
+        % Adjust real_angle if necessary (wrap around)
+        real_angle = mod(real_angle, 2*pi);
+        
+        % Find the index of the closest angle in the Angles array
+        [~, angle_idx] = min(abs(Angles - real_angle));
+        
+        % Extract the corresponding frame square (use the windowed frame)
+        frame_square = frame1_windowed(y_range, x_range);
+        
+        % Extract the wavelet coefficients for the square
+        spec_square = spec1(:, :, :, :);
+        
+        % Plot using image_with_wavelet_overlay
+        subplot(nrows, ncols, subplot_idx);
+        clevfactor = 1;  % Adjust as needed
+        ProcessFlag = 1; % Use ProcessFlag = 1 for normalized display
+        
+        % Call the overlay function
+        image_with_wavelet_overlay(frame_square, spec_square, Scales, scale_idx, angle_idx, clevfactor, ProcessFlag);
+        
+        % Overlay the mask contour from coherence_mask
+        coherence_mask = coherence_masks{i};  % Get the mask for this peak
+        hold on;
+        contour(coherence_mask, [1 1], 'magenta', 'LineWidth', 1);  % Magenta contour at mask boundary
+        hold off;
+        
+        % Set title with scale and angle
+        wavelength_km = real_scale * pi/sqrt(2) * pixel_size_km;
+        title(sprintf('Wavelength: %.1f km, Angle: %.2f°', wavelength_km, real_angle * (180/pi)));
+        
+        % Ensure axis is equal and tight
+        axis equal;
+        axis tight;
+        
+        current_peak = current_peak + 1;
+    end
+    
+    sgtitle('Wavelet Contours Overlaid on Image Zoomed into Square');
+end
 
 %% 8) Calcul & Affichage des Speed (sine waves)
 num_peaks = size(peak_list, 1);
@@ -728,15 +1045,6 @@ function image_with_wavelet_overlay(img, spec, Scales, scale_idx, angle_idx, cle
     contour(wavelet_abs.^2, 'LevelList', power_levels, 'LineColor', 'white', 'LineWidth', 1);
 
     hold off;
-end
-
-function data_out = preprocessData(data_in)
-    lowerClip = prctile(data_in(:), 1);
-    upperClip = prctile(data_in(:), 99);
-    data_in(data_in < lowerClip) = lowerClip;
-    data_in(data_in > upperClip) = upperClip;
-    data_smooth = imgaussfilt(data_in, 1);
-    data_out = data_smooth;
 end
 
 function img_processed = processDataMethod(data, methodName)
