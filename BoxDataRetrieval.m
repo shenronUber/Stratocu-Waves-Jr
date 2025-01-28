@@ -332,7 +332,6 @@ function createVideo(fileNames, fileTimestamps, downloadDir, outputVideoFile, da
     fprintf('Video saved to %s\n', outputVideoFile);
 end
 
-
 function plotHistogram(img)
     % Check if the image has three dimensions
     if ndims(img) == 3
