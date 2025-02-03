@@ -84,8 +84,10 @@ disp({info.Variables.Name});
 %%
 
 % Exemple:
-startDate = datetime(2023,09,28,1,0,0);
-endDate   = datetime(2023,09,29,1,0,0);
+%startDate = datetime(2023,09,28,1,0,0);
+%endDate   = datetime(2023,09,29,1,0,0);
+startDate = datetime(2023, 10, 12, 1, 0, 0);
+endDate   = datetime(2023, 10, 12, 9, 0, 0);
 
 sourceRoot   = 'C:\Users\admin\Box\GOES2go_satellite_downloads';
 outputRoot   = 'C:\Users\admin\Box\GWaves_2023_10_11-14_SEPAC';
@@ -103,10 +105,10 @@ function SingleFrameWavelet_Code
     %% 1) Basic Setup
     %----------------------------------------------------------------------
     % Date range and folder
-    %startDate = datetime(2023, 10, 12, 1, 0, 0);
-    %endDate   = datetime(2023, 10, 12, 9, 0, 0);
-    startDate = datetime(2023,09,28,1,0,0);
-    endDate   = datetime(2023,09,29,1,0,0);
+    startDate = datetime(2023, 10, 12, 1, 0, 0);
+    endDate   = datetime(2023, 10, 12, 9, 0, 0);
+    %startDate = datetime(2023,09,28,1,0,0);
+    %endDate   = datetime(2023,09,29,1,0,0);
 
     dataType = 'IR';
 
@@ -139,12 +141,16 @@ function SingleFrameWavelet_Code
     pixel_size_km     = original_px_km * shrinkfactor;      % final pixel size after shrink
 
     % Wavelet parameters
-    NANGLES = 12;
-    Angles  = 0 : pi/(NANGLES-1) : pi;
-    
-    Scales_km= [10,50,80,110,140,170,200,230,300,405];
-    NSCALES   = numel(Scales_km);
-    Scales    = Scales_km / pixel_size_km;   % in pixel units
+    %NANGLES = 12;
+    %Angles  = 0 : pi/(NANGLES-1) : pi;
+    Angles  = pi/9 : pi/9 :8*pi/9;
+    NANGLES = numel(Angles);
+
+    %Scales_km= [10,50,80,110,140,170,200,230,300,405];
+    %NSCALES   = numel(Scales_km);
+    %Scales    = Scales_km / pixel_size_km;   % in pixel units
+    Scales = [2,4,8,16,32,64,128];
+    NSCALES   = numel(Scales);
 
     % Retrieve all .nc in the date range
     [fileNames, fileTimestamps, variableName] = getDateRangeFiles(boxRootDir, startDate, endDate);
@@ -159,6 +165,7 @@ function SingleFrameWavelet_Code
     %% 2) Loop Over Frames (Single-Frame Wavelet + Annotated Images)
     %----------------------------------------------------------------------
     for f_idx = 1 : num_frames
+        %%
         fileName = fileNames{f_idx};
         fileTime = fileTimestamps(f_idx);
         fprintf('[%d/%d] Processing file: %s\n', f_idx, num_frames, fileName);
@@ -180,12 +187,14 @@ function SingleFrameWavelet_Code
             data_pro = imresize(data_pro, invshrinkfactor);
         end
 
-        % (Optional) Radial window
-        doRadialWindow = true;
-        if doRadialWindow
-            radius_factor = 1.1;  
-            decay_rate    = 0.05; 
-            data_pro = applyRadialWindow(data_pro, radius_factor, decay_rate);
+        % (Optional) Windowing
+        doWindow = true;
+        if doWindow
+            radius_factor = 0.8;  
+            decay_rate    = 10; 
+            %data_pro = applyRadialWindow(data_pro, radius_factor, decay_rate);
+            data_pro = applyRectangularWindow(data_pro, radius_factor, decay_rate);
+            
         end
 
         % 2b) Build squares from the final dimension
@@ -285,9 +294,9 @@ function SingleFrameWavelet_Code
         else
             fprintf('NetCDF file already exists, skipping creation: %s\n', ncFileName);
         end
-
+%%
         produceAnnotatedImages(dataType,spec_full, data_filt, squares, Scales, Angles, outDir, ...
-            frameDateStr, pixel_size_km, 1, 1);
+            frameDateStr, 1, 1);
     end
 
     fprintf('Single-frame wavelet processing completed. Results in %s\n', waveletResultsDir);
@@ -370,7 +379,8 @@ function data_preprocessed = preprocessFrame(data, dataType, methodName)
             %-----------------------------------------------------
             % (1) IR-specific threshold or masking
             %-----------------------------------------------------
-            threshold = prctile(data(:), 5);
+            %threshold = prctile(data(:), 5);
+            threshold = 275;
             data(data < threshold) = NaN; 
             
             % Remember which pixels were set to NaN
@@ -497,9 +507,29 @@ function data_win = applyRadialWindow(data_in, radius_factor, decay_rate)
     data_win = data_in .* window;
 end
 
+function data_win = applyRectangularWindow(data_in, radius_factor, decay_rate)
+    [rows, cols] = size(data_in);
+    cx = cols/2; 
+    cy = rows/2;
+    [X, Y] = meshgrid(1:cols, 1:rows);
+    
+    % Calculate normalized distances from center
+    dx = abs(X - cx)/cx;  % Normalized horizontal distance (0-1)
+    dy = abs(Y - cy)/cy;  % Normalized vertical distance (0-1)
+    
+    % Chebyshev distance with aspect ratio preservation
+    R = max(dx, dy);  % Max of normalized distances
+    
+    % Create adaptive window
+    window = 1 ./ (1 + exp(decay_rate * (R - radius_factor)));
+    
+    % Apply window to input data
+    data_win = data_in .* window;
+end
+
 function produceAnnotatedImages(dataType, spec_full, data_background, squares, ...
                                 Scales, Angles, outDir, frameDateStr, ...
-                                pixel_size_km, clevfactor, saverose)
+                                clevfactor, saverose)
 % PRODUCEANNOTATEDIMAGES Main processing function for wavelet analysis visualization.
 %
 % Inputs:
@@ -511,7 +541,6 @@ function produceAnnotatedImages(dataType, spec_full, data_background, squares, .
 %   Angles             - Vector of wavelet angles
 %   outDir             - Output directory path
 %   frameDateStr       - Frame timestamp string
-%   pixel_size_km      - Pixel size in kilometers
 %   clevfactor         - Contour level adjustment factor
 %   saverose           - Boolean flag to save (true) or skip saving (false) the waverose image
 %
@@ -572,15 +601,21 @@ uistack(ax1, 'top');
 linkprop([ax1 ax2], {'XLim','YLim','Position','CameraPosition','CameraUpVector'});
 
 % 2.2) Threshold-based peak detection on original (non-interpolated) data
-threshold_orig = 0.7 * max(innerpower(:));
+threshold_orig = mean(innerpower(:)) + 0.1 * std(innerpower(:));
+%threshold_orig = 0.7 * max(innerpower(:));
 bwMask_orig = innerpower >= threshold_orig;
 CC = bwconncomp(bwMask_orig, 4);
 numPeaks = CC.NumObjects;
 
 % Contour on interpolated data for visualization
-threshold_viz = 0.7 * max(innerpower_fine(:));
-contour(ax1, X_pos_fine, Y_pos_fine, innerpower_fine, [threshold_viz threshold_viz], 'r-', 'LineWidth',2);
-contour(ax2, X_neg_fine, Y_neg_fine, innerpower_fine, [threshold_viz threshold_viz], 'r-', 'LineWidth',2);
+% Create (Theta, R) for original array
+[Theta_orig, R_orig] = meshgrid(Angles, Scales);
+[X_orig, Y_orig] = pol2cart(Theta_orig, R_orig);
+
+contour(ax1, X_orig, Y_orig, innerpower, [threshold_orig threshold_orig], 'r-', 'LineWidth',2);
+contour(ax2, X_orig, Y_orig, innerpower, [threshold_orig threshold_orig], 'r-', 'LineWidth',2);
+%contour(ax1, X_pos_fine, Y_pos_fine, innerpower_fine, [threshold_orig threshold_orig], 'r-', 'LineWidth',2);
+%contour(ax2, X_neg_fine, Y_neg_fine, innerpower_fine, [threshold_orig threshold_orig], 'r-', 'LineWidth',2);
 
 %% 2.2) Label peaks in the rose
 % We compute each region’s mean scale and angle, then place a text label.
@@ -600,21 +635,16 @@ for pk = 1:numPeaks
 end
 
 % -------------------------------------------------------------------------
-% 3) Annotations and Labels
+%% 3) Annotations and Labels
 % -------------------------------------------------------------------------
 % 3.1) Draw radial grid circles for scales
-if exist('pixel_size_km', 'var')
-    wavelengths_km = Scales * pi/sqrt(2) * pixel_size_km;
-else
-    wavelengths_km = Scales;
-end
 
 for i = 1:length(Scales)
     theta_ring = linspace(0, 2*pi, 100);
     [x_ring, y_ring] = pol2cart(theta_ring, Scales(i));
     plot(ax1, x_ring, y_ring, 'k--', 'LineWidth', 0.5);
     plot(ax2, x_ring, y_ring, 'k--', 'LineWidth', 0.5);
-    text(ax1, Scales(i)*1.05, 0, sprintf('%.1f km', wavelengths_km(i)),...
+    text(ax1, Scales(i)*1.05, 0, sprintf('%.1f', Scales(i)),...
          'HorizontalAlignment', 'left', 'FontSize', 8);
 end
 
@@ -659,7 +689,7 @@ end
 close(figRose);
 
 % -------------------------------------------------------------------------
-% 4) Region Processing and Image Output
+%% 4) Region Processing and Image Output
 % -------------------------------------------------------------------------
 % Compute scale factor between original and wavelet grid
 scaleFactorX = Nx_orig / Nx_sh;
@@ -670,12 +700,12 @@ peakRegions = cell(numPeaks,1);
 for pk = 1:numPeaks
     [scaleIndices, angleIndices] = ind2sub(size(bwMask_orig), CC.PixelIdxList{pk});
     
-    % Convert scale index to kilometers (if pixel_size_km is provided)
-    scales_km = Scales(scaleIndices) * pi/sqrt(2) * pixel_size_km;
+    
+    scales = Scales(scaleIndices);
     angles_deg = rad2deg(Angles(angleIndices));
     
     % Format as strings
-    scale_str = join(split(num2str(scales_km,'%.1f ')), '/');
+    scale_str = join(split(num2str(scales,'%.1f ')), '/');
     angle_str = join(split(num2str(angles_deg,'%.0f ')), '/');
     
     peakRegions{pk} = struct(...
@@ -744,7 +774,7 @@ for pk = 1:numPeaks
     
     % Multi-line title with scales and angles
     titleText = {sprintf('Instrument X - %s', frameDateStr), ...
-                 sprintf('Peak %d/%d - Scales: %s km', pk, numPeaks, peakRegions{pk}.ScaleStr), ...
+                 sprintf('Peak %d/%d - Scales: %s', pk, numPeaks, peakRegions{pk}.ScaleStr), ...
                  sprintf('Angles: %s°', peakRegions{pk}.AngleStr)};
     title(titleText, 'Color', 'k', 'FontWeight','bold', 'FontSize', 10, 'Interpreter', 'none');
     
