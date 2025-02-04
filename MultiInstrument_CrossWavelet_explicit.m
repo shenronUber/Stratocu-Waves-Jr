@@ -13,8 +13,10 @@ function MultiInstrument_CrossWavelet_explicit()
 %==========================================================================
 %% 1) VARIABLES SETUP
 %----------- DATE/TIME SETTINGS ---------------------------
-startDate = datetime(2023,09,28,14,0,0);      % Start of processing period
-endDate   = datetime(2023,09,28,15,0,0);       % End of processing period
+startDate = datetime(2023, 10, 11, 1, 0, 0);     % Start of processing period
+endDate   = datetime(2023, 10, 14, 9, 0, 0);    % End of processing period
+
+
 
 %----------- FOLDER/PATH SETTINGS ---------------------------
 rootSepacDir = 'C:\Users\admin\Box\GWaves_2023_10_11-14_SEPAC';  
@@ -54,6 +56,7 @@ IR_fillPercentile = 50;     % Fill IR masked pixels with this percentile
 % For VIS
 VIS_lowerPercentile = 10;   % VIS lower bound (percentile)
 VIS_upperPercentile = 99;   % VIS upper bound (percentile)
+VIS_fillPercentile = 50;    % Fill VIS NaN pixels with this percentile
 
 %----------- HIGH-PASS FILTER SETTINGS ----------------------
 clipMinHP = -3;             % Minimum value to clip after highpass filtering
@@ -67,13 +70,13 @@ IR_methodName = 'highpass_50_sqrt';  % Preprocessing method for IR
 VIS_methodName = 'none';              % Preprocessing method for VIS
 
 %----------- WAVE-ROSE & PEAK DETECTION ---------------------
-nAngles_fineFactor = 4;     % Factor to refine angular resolution in the rose plot
-nScales_fineFactor = 4;     % Factor to refine scale resolution in the rose plot
-peakDetectionFactor = 0.1;  % Threshold factor (mean + factor*std) for peak detection
-numContourLevels = 5;       % Number of contour levels in overlays
+nAngles_fineFactor  = 4;            % Factor to refine angular resolution in the rose plot
+nScales_fineFactor  = 4;            % Factor to refine scale resolution in the rose plot
+peakDetectionFactor = 0.1;          % Threshold factor (mean + factor*std) for peak detection
+contourArray        = [95 97 99];   %[Used as either percentiles or absolute values for the contouring]
+ArrayMode           = 'percentile'; % determines if the array represent 'percentile' or 'absolute' values
 
 %----------- IMAGE ANNOTATIONS & OUTPUT ---------------------
-clevfactor = 1;             % Factor for adjusting contour levels
 saverose = 1;               % Flag to save the wave-rose image
 
 %% 2) BASIC SETUP
@@ -163,9 +166,9 @@ for f_idx = 1:numCommon
         end
         % Preprocess the data.
         data_pre = preprocessFrame(data, instr, methodName, ...
-            IR_threshold, IR_fillPercentile, ...
+            thisFullPath,thisTime,IR_threshold, IR_fillPercentile, ...
             VIS_lowerPercentile, VIS_upperPercentile, ...
-            clipMinHP, clipMaxHP, ...
+            VIS_fillPercentile,clipMinHP, clipMaxHP, ...
             lowPassFilterWidth_20, lowPassFilterWidth_50, lowPassFilterWidth_100);
         data_filt = data_pre;  % Keep a copy for annotations.
         
@@ -248,7 +251,9 @@ for f_idx = 1:numCommon
             ncwrite(singleNcFile, 'scales', Scales);
             ncwrite(singleNcFile, 'angles', Angles);
             fprintf('Saved single-wavelet NetCDF for %s at %s -> %s\n', instr, frameDateStr, singleNcFile);
-            produceAnnotatedImages(instr, spec_full, data_filt, squares, Scales, Angles, singleOutDir, frameDateStr, pixel_size_km, clevfactor, saverose, nAngles_fineFactor, nScales_fineFactor, peakDetectionFactor, numContourLevels);
+            produceAnnotatedImages(instr, spec_full, data_filt, squares, Scales, Angles, singleOutDir, ...
+                frameDateStr, saverose, nAngles_fineFactor, ...
+                nScales_fineFactor, peakDetectionFactor, ArrayMode, contourArray);
         else
             fprintf('NetCDF for %s at %s already exists. Skipping creation.\n', instr, frameDateStr);
         end
@@ -418,28 +423,104 @@ function [fileNames, fileTimestamps, variableName] = getDateRangeFiles(dataDir, 
 end
 %--------------------------------------------------------------------------
 
-function data_preprocessed = preprocessFrame(data, dataType, methodName, ...
-    IR_threshold, IR_fillPercentile, ...
+function data_preprocessed = preprocessFrame(data, dataType, methodName, fullPath, ...
+    fileTime, IR_threshold, IR_fillPercentile, ...
     VIS_lowerPercentile, VIS_upperPercentile, ...
-    clipMinHP, clipMaxHP, ...
+    VIS_fillPercentile, clipMinHP, clipMaxHP, ...
     lpWidth20, lpWidth50, lpWidth100)
+% PREPROCESSFRAME
+%  Applies data-type-specific thresholds and then calls the chosen
+%  method-based process. Fills or clamps as needed.
+
     switch upper(dataType)
         case 'IR'
-            data(data < IR_threshold) = NaN;
+            % (1) IR-specific threshold or masking
+            data(data < IR_threshold) = NaN; 
             nan_mask = isnan(data);
+            
+            % Fill masked region with the average (or any fallback)
             data(nan_mask) = mean(data(:), 'omitnan');
-            data_preprocessed = processDataMethod(data, methodName, clipMinHP, clipMaxHP, lpWidth20, lpWidth50, lpWidth100);
+
+            % (2) Process by methodName
+            data_preprocessed = processDataMethod(data, methodName, ...
+                clipMinHP, clipMaxHP, ...
+                lpWidth20, lpWidth50, lpWidth100);
+
+            % (3) Fill masked region with a chosen percentile value
             fill_value = prctile(data_preprocessed(:), IR_fillPercentile);
             data_preprocessed(nan_mask') = fill_value;
+
         case 'VIS'
+            % (1) VIS-specific threshold or dynamic range
             lowerBound = prctile(data(:), VIS_lowerPercentile);
             upperBound = prctile(data(:), VIS_upperPercentile);
             data(data < lowerBound) = lowerBound;
             data(data > upperBound) = upperBound;
-            data_preprocessed = processDataMethod(data, methodName, clipMinHP, clipMaxHP, lpWidth20, lpWidth50, lpWidth100);
+
+            nan_mask = isnan(data);
+            
+            % (2) Correct for uneven solar exposure
+
+            lat_vec = ncread(fullPath, 'latitude');   % [1125 x 1] => vecteur lat vector
+            lon_vec = ncread(fullPath, 'longitude');  % [1500 x 1] => vecteur lon vector
+            data    = ncread(fullPath, 'Rad');        % [1500 x 1125] => [lon, lat]
+        
+            % Transpose [lat, lon]
+            % data(i,j) => i=lat, j=lon
+            data = data.';
+            data(data < 0) = 0;
+       
+            [lonGrid, latGrid] = meshgrid(lon_vec, lat_vec);
+            %  => size(LatGrid) = size(LonGrid) = [1125 x 1500]
+        
+            % We convert datetime into datenum for the function.
+            dt_num = datenum(fileTime);
+        
+            % Solar parameters
+            time_zone = 0;    
+            rotation  = 0;     
+            dst       = false; 
+
+            % Getting the insolation for each pixel
+            insolation_grid = computeInsolationGrid(dt_num, latGrid, lonGrid, time_zone, rotation, dst);
+            
+            epsilon = 1;  % Minimal threshold to avoid division by 0
+            insolation_grid( insolation_grid < epsilon) = epsilon;
+
+            target_insol = median(insolation_grid(:));
+            target_max = max(data,[],'all');
+
+            min_insol = 15; % in W/m² 
+            insol_adj = max(insolation_grid, min_insol);
+
+            %The factor is the ratio between the target value and the local insolation.
+            corr_factor = target_insol ./ insol_adj;
+            % Force factor to 1 min => no “reduction” in lit areas
+            corr_factor(corr_factor < 1) = 1;
+
+            % Limit correction factor to avoid extreme corrections
+            max_corr = 5; % Do not multiply by more than 5
+            corr_factor(corr_factor > max_corr) = max_corr;
+
+            % 5. Apply correction on radiance
+            data = data .* corr_factor;
+            data(data>target_max)=target_max;
+            data = data.';    
+
+            % (3) Process by methodName
+            data_preprocessed = processDataMethod(data, methodName, ...
+                clipMinHP, clipMaxHP, ...
+                lpWidth20, lpWidth50, lpWidth100);
+
+            fill_value = prctile(data_preprocessed(:), VIS_fillPercentile);
+            data_preprocessed(nan_mask') = fill_value;
+
         otherwise
+            % Fallback
             warning('Unrecognized dataType: %s. Using fallback method.', dataType);
-            data_preprocessed = processDataMethod(data, methodName, clipMinHP, clipMaxHP, lpWidth20, lpWidth50, lpWidth100);
+            data_preprocessed = processDataMethod(data, methodName, ...
+                clipMinHP, clipMaxHP, ...
+                lpWidth20, lpWidth50, lpWidth100);
     end
 end
 %--------------------------------------------------------------------------
@@ -534,48 +615,51 @@ end
 %--------------------------------------------------------------------------
 
 function produceAnnotatedImages(dataType, spec_full, data_background, squares, ...
-    Scales, Angles, outDir, frameDateStr, pixel_size_km, clevfactor, saverose, ...
-    nAngles_fineFactor, nScales_fineFactor, peakDetectionFactor, numContourLevels)
+    Scales, Angles, outDir, frameDateStr, ...
+    saverose, nAngles_fineFactor, nScales_fineFactor, ...
+    peakDetectionFactor,contourOption, contourArray)
 % PRODUCEANNOTATEDIMAGES
-%  Creates annotated images for wavelet analysis visualization.
-%
-% Inputs:
-%   dataType         - 'IR' or 'VIS'
-%   spec_full        - 4D wavelet coefficients [Ny, Nx, nScales, nAngles]
-%   data_background  - Original 2D background data
-%   squares          - ROI information structure array
-%   Scales, Angles   - Wavelet scales and angles
-%   outDir           - Output directory for images
-%   frameDateStr     - Timestamp string for the frame
-%   pixel_size_km    - Pixel size in km (used for scale annotation)
-%   clevfactor       - Contour level adjustment factor
-%   saverose         - Flag to save the rose image (1 to save)
-%   nAngles_fineFactor, nScales_fineFactor - Refinement factors for interpolation in the polar plot
-%   peakDetectionFactor - Factor to compute the threshold for peak detection
-%   numContourLevels - Number of contour levels for overlays
+%  Creates a wave-rose plot (in polar form, duplicated for ± angles),
+%  detects peaks based on a threshold, and creates overlay images for each
+%  peak region with wavelet real-part and power contours.
+
 
     %% 1) Dimensions & Basic Summaries
     [Ny_sh, Nx_sh, nScales, nAngles] = size(spec_full);
     [Ny_orig, Nx_orig] = size(data_background);
-    
-    power = abs(spec_full).^2;  
+
+    power = abs(spec_full).^2;  % wavelet power
     innerpower = squeeze(mean(mean(power, 1, 'omitnan'), 2, 'omitnan'));
-    
-    %% 2) Wave-Rose Visualization
+
+    %% 2) Wave-Rose Visualization with Logarithmic Radial Scale
+    % 2.1) Interpolate power to a finer grid
     Angles_fine = linspace(min(Angles), max(Angles), nAngles_fineFactor*nAngles);
-    Scales_fine = linspace(min(Scales), max(Scales), nScales_fineFactor*nScales);
+    % Use a logarithmic spacing for scales:
+    % First, create a linear grid and then take the logarithm.
+    % Alternatively, you could directly use logspace. Here we demonstrate by
+    % applying the logarithm to the linear grid.
+    Scales_fine_linear = linspace(min(Scales), max(Scales), nScales_fineFactor*nScales);
     
+    % Create meshgrids for the original and fine grids:
     [Theta_orig, R_orig] = meshgrid(Angles, Scales);
-    [Theta_fine, R_fine] = meshgrid(Angles_fine, Scales_fine);
+    [Theta_fine, R_fine] = meshgrid(Angles_fine, Scales_fine_linear);
     
+    % Transform the radial coordinate to a logarithmic scale.
+    % (Assumes Scales > 0.)
+    R_orig_log = log10(R_orig);
+    R_fine_log = log10(R_fine);
+    
+    % Interpolate the innerpower on the original (linear) grid and then use
+    % the logarithmic radial coordinates for plotting.
     F = griddedInterpolant(Theta_orig', R_orig', innerpower', 'spline');
     innerpower_fine = F(Theta_fine', R_fine')';
     
-    [X_pos_fine, Y_pos_fine] = pol2cart(Theta_fine, R_fine);
-    [X_neg_fine, Y_neg_fine] = pol2cart(Theta_fine + pi, R_fine);
+    % Compute cartesian coordinates for the fine grid using the log-transformed radius:
+    [X_pos_fine, Y_pos_fine] = pol2cart(Theta_fine, R_fine_log);
+    [X_neg_fine, Y_neg_fine] = pol2cart(Theta_fine + pi, R_fine_log);
     
     figRose = figure('visible','off');
-    ax1 = axes('Position',[0.1 0.1 0.75 0.75]); 
+    ax1 = axes('Position',[0.1 0.1 0.75 0.75]);
     hold(ax1, 'on');
     pcolor(ax1, X_pos_fine, Y_pos_fine, innerpower_fine);
     shading(ax1, 'interp');
@@ -591,49 +675,60 @@ function produceAnnotatedImages(dataType, spec_full, data_background, squares, .
     uistack(ax1, 'top');
     linkprop([ax1 ax2], {'XLim','YLim','Position','CameraPosition','CameraUpVector'});
     
-    % Peak detection
+    % 2.2) Peak detection based on threshold (for labeling)
     threshold_orig = mean(innerpower(:)) + peakDetectionFactor * std(innerpower(:));
-    bwMask_orig = innerpower >= threshold_orig;
+    bwMask_orig = (innerpower >= threshold_orig);
     CC = bwconncomp(bwMask_orig, 4);
     numPeaks = CC.NumObjects;
     
-    [X_orig, Y_orig] = pol2cart(Theta_orig, R_orig);
+    % Draw contour lines on the coarse (original) polar grid.
+    [X_orig, Y_orig] = pol2cart(Theta_orig, R_orig_log);
     contour(ax1, X_orig, Y_orig, innerpower, [threshold_orig threshold_orig], 'r-', 'LineWidth',2);
     contour(ax2, X_orig, Y_orig, innerpower, [threshold_orig threshold_orig], 'r-', 'LineWidth',2);
     
+    % Label each connected region (peak) on the polar plot.
     for pk = 1:numPeaks
         [scaleIndices, angleIndices] = ind2sub(size(bwMask_orig), CC.PixelIdxList{pk});
         meanScale = mean(Scales(scaleIndices), 'omitnan');
         meanAngle = mean(Angles(angleIndices), 'omitnan');
-        [x_peak, y_peak] = pol2cart(meanAngle, meanScale);
-        text(ax1, x_peak, y_peak, sprintf('%d', pk), 'Color','k','FontWeight','bold', 'HorizontalAlignment','center','VerticalAlignment','middle');
+        [x_peak, y_peak] = pol2cart(meanAngle, log10(meanScale));
+        text(ax1, x_peak, y_peak, sprintf('%d', pk), ...
+            'Color','k','FontWeight','bold', ...
+            'HorizontalAlignment','center','VerticalAlignment','middle');
     end
     
-    % Radial and angular grid overlays.
+    %% 2.3) Annotations and Grid Overlays (using logarithmic radial axis)
+    % Radial circles: plot circles at each original scale, but use log10(scales)
     for i = 1:length(Scales)
         theta_ring = linspace(0, 2*pi, 100);
-        [x_ring, y_ring] = pol2cart(theta_ring, Scales(i));
+        [x_ring, y_ring] = pol2cart(theta_ring, log10(Scales(i)));
         plot(ax1, x_ring, y_ring, 'k--', 'LineWidth',0.5);
         plot(ax2, x_ring, y_ring, 'k--', 'LineWidth',0.5);
-        % Annotate using the pixel size in km.
-        wavelength_km = Scales(i) * pixel_size_km * pi/sqrt(2);
-        text(ax1, Scales(i)*1.05, 0, sprintf('%.1f km', wavelength_km), 'HorizontalAlignment','left', 'FontSize',8);
+        % Label the circle with the original scale value.
+        text(ax1, log10(Scales(i))*1.05, 0, sprintf('%.1f', Scales(i)), ...
+            'HorizontalAlignment','left','FontSize',8);
     end
     
+    % Angular lines
     angle_ticks = linspace(0, 2*pi, 13);
-    angle_labels = {'0','\pi/6','\pi/3','\pi/2','2\pi/3','5\pi/6','\pi','7\pi/6','4\pi/3','3\pi/2','5\pi/3','11\pi/6','2\pi'};
-    max_r = max(Scales)*1.1;
+    angle_labels = {'0','\pi/6','\pi/3','\pi/2','2\pi/3','5\pi/6','\pi',...
+                    '7\pi/6','4\pi/3','3\pi/2','5\pi/3','11\pi/6','2\pi'};
+    max_r = log10(max(Scales)) * 1.1;
+    
     for i = 1:length(angle_ticks)
         [x_label, y_label] = pol2cart(angle_ticks(i), max_r);
-        line(ax1, [0 x_label], [0 y_label], 'Color',[0.5 0.5 0.5], 'LineStyle','--');
-        line(ax2, [0 x_label], [0 y_label], 'Color',[0.5 0.5 0.5], 'LineStyle','--');
+        line(ax1, [0 x_label], [0 y_label], 'Color',[0.5 0.5 0.5],'LineStyle','--');
+        line(ax2, [0 x_label], [0 y_label], 'Color',[0.5 0.5 0.5],'LineStyle','--');
         if angle_ticks(i) <= pi
-            text(ax1, x_label*1.05, y_label*1.05, angle_labels{i}, 'HorizontalAlignment','center', 'FontSize',8);
+            text(ax1, x_label*1.05, y_label*1.05, angle_labels{i}, ...
+                'HorizontalAlignment','center','FontSize',8);
         else
-            text(ax2, x_label*1.05, y_label*1.05, angle_labels{i}, 'HorizontalAlignment','center', 'FontSize',8);
+            text(ax2, x_label*1.05, y_label*1.05, angle_labels{i}, ...
+                'HorizontalAlignment','center','FontSize',8);
         end
     end
     
+    % Colorbar for the polar plot
     c = colorbar(ax1, 'Location','eastoutside');
     c.Label.String = 'Wavelet Power';
     c.Label.FontWeight = 'bold';
@@ -642,7 +737,8 @@ function produceAnnotatedImages(dataType, spec_full, data_background, squares, .
     ax1.Position = ax1_pos;
     ax2.Position = ax1_pos;
     
-    title(ax1, sprintf('Polar Wave-Rose: %d Significant Regions', numPeaks), 'FontSize',12, 'FontWeight','bold');
+    title(ax1, sprintf('Polar Wave-Rose: %d Significant Regions', numPeaks), ...
+        'FontSize',12, 'FontWeight','bold');
     
     if saverose
         roseName = fullfile(outDir, sprintf('WaveRose_%s.png', frameDateStr));
@@ -650,24 +746,30 @@ function produceAnnotatedImages(dataType, spec_full, data_background, squares, .
     end
     close(figRose);
     
-    %% 3) Region Summaries & Overlays
+    %% 3) Region Summaries & Overlays (Final Annotated Image)
     scaleFactorX = Nx_orig / Nx_sh;
     scaleFactorY = Ny_orig / Ny_sh;
     
     peakRegions = cell(numPeaks,1);
     for pk = 1:numPeaks
         [scaleIndices, angleIndices] = ind2sub(size(bwMask_orig), CC.PixelIdxList{pk});
-        scales = Scales(scaleIndices);
+        scales     = Scales(scaleIndices);
         angles_deg = rad2deg(Angles(angleIndices));
-        scale_str = join(split(num2str(scales, '%.1f ')), '/');
-        angle_str = join(split(num2str(angles_deg, '%.0f ')), '/');
-        peakRegions{pk} = struct('ScaleIndices', scaleIndices, 'AngleIndices', angleIndices, 'ScaleStr', scale_str{1}, 'AngleStr', angle_str{1});
+    
+        scale_str = join(split(num2str(scales,'%.1f ')), '/');
+        angle_str = join(split(num2str(angles_deg,'%.0f ')), '/');
+    
+        peakRegions{pk} = struct('ScaleIndices',scaleIndices,...
+                                 'AngleIndices',angleIndices,...
+                                 'ScaleStr',scale_str{1},...
+                                 'AngleStr',angle_str{1});
     end
     
     for pk = 1:numPeaks
         waveSum = zeros(Ny_sh, Nx_sh);
         wavePower = zeros(Ny_sh, Nx_sh);
         currentRegion = peakRegions{pk};
+    
         for jj = 1:numel(currentRegion.ScaleIndices)
             s_idx = currentRegion.ScaleIndices(jj);
             a_idx = currentRegion.AngleIndices(jj);
@@ -675,51 +777,64 @@ function produceAnnotatedImages(dataType, spec_full, data_background, squares, .
             waveSum = waveSum + real(coeff);
             wavePower = wavePower + abs(coeff).^2;
         end
-        waveSum_up = imresize(waveSum, [Ny_orig, Nx_orig]);
+    
+        waveSum_up   = imresize(waveSum,   [Ny_orig, Nx_orig]);
         wavePower_up = imresize(wavePower, [Ny_orig, Nx_orig]);
-        
+    
         fig = figure('visible','off');
         switch upper(dataType)
             case 'IR'
-                imagesc(data_background, [0 1]);
+                imagesc(data_background, [0 1])
             case 'VIS'
-                imagesc(data_background);
+                image(data_background);
             otherwise
                 error('Unknown dataType.');
         end
         colormap(gray);
         axis image off;
         hold on;
-        
-        std_real = std(waveSum_up(:));
-        pos_levels = linspace(std_real, max(waveSum_up(:)), numContourLevels) / clevfactor;
-        neg_levels = linspace(-std_real, min(waveSum_up(:)), numContourLevels) / clevfactor;
-        std_power = std(wavePower_up(:));
-        power_levels = linspace(std_power, max(wavePower_up(:)), numContourLevels) / (clevfactor^2);
-        
-        contour(waveSum_up, pos_levels, 'LineColor','red', 'LineWidth',0.5);
-        contour(waveSum_up, neg_levels, 'LineColor','blue', 'LineWidth',0.5);
-        contour(wavePower_up, power_levels, 'LineColor',[0.99 0.99 0.99], 'LineWidth',0.5);
-        
+    
+        % ----- NEW CONTOUR LEVEL SYSTEM -----
+        % Choose contour levels based on either absolute values or percentiles.
+        switch lower(contourOption)
+            case 'absolute'
+                % Use the provided absolute values (assumed positive) for contours.
+                % Draw red contours at the positive levels and blue contours at the corresponding negative levels.
+                contourLevels = contourArray;
+            case 'percentile'
+                % Compute the given percentiles on the absolute values of waveSum_up.
+                contourLevels = prctile(abs(waveSum_up(:)), contourArray);
+            otherwise
+                error('Unknown contour option. Choose either "absolute" or "percentile".');
+        end
+    
+        % Plot contours:
+        % For positive values:
+        contour(waveSum_up, contourLevels, 'LineColor','red', 'LineWidth',0.5);
+        % For negative values (mirror the levels):
+        contour(waveSum_up, -contourLevels, 'LineColor','blue', 'LineWidth',0.5);
+    
+        % ----- Draw ROI squares in final image -----
         for sq = 1:numel(squares)
             xPos_orig = squares(sq).x_range(1) * scaleFactorX;
             yPos_orig = squares(sq).y_range(1) * scaleFactorY;
-            w_orig = length(squares(sq).x_range) * scaleFactorX;
-            h_orig = length(squares(sq).y_range) * scaleFactorY;
-            rectangle('Position',[xPos_orig, yPos_orig, w_orig, h_orig], 'EdgeColor','k','LineWidth',1);
+            w_orig    = length(squares(sq).x_range) * scaleFactorX;
+            h_orig    = length(squares(sq).y_range) * scaleFactorY;
+            rectangle('Position',[xPos_orig, yPos_orig, w_orig, h_orig],...
+                'EdgeColor','k','LineWidth',1);
         end
-        
-        titleText = {sprintf('Instrument %s - %s', dataType, frameDateStr), ...
+    
+        titleText = {sprintf('Instrument X - %s', frameDateStr), ...
                      sprintf('Peak %d/%d - Scales: %s', pk, numPeaks, peakRegions{pk}.ScaleStr), ...
                      sprintf('Angles: %s°', peakRegions{pk}.AngleStr)};
         title(titleText, 'Color','k','FontWeight','bold','FontSize',10,'Interpreter','none');
-        
+    
         outName = fullfile(outDir, sprintf('Frame_%s_Region%02d.png', frameDateStr, pk));
         saveas(fig, outName);
         close(fig);
     end
 end
-%==========================================================================
+%--------------------------------------------------------------------------
 
 function renameAndOrganizeFiles(dataType, startDate, endDate, sourceRootDir, outRootDir)
     switch upper(dataType)
@@ -798,4 +913,132 @@ function out = normalizeDataNaN(data)
     data(nanMask) = min(data(~nanMask));
     out = normalizeData(data);
 end
+%--------------------------------------------------------------------------
+
+function insolation = computeInsolationGrid(datetime_val, latGrid, lonGrid, time_zone, rotation, dst)
+% COMPUTEINSOLATIONGRID_PARALLEL Computes solar insolation (W/m²) over a latitude/longitude grid
+% using parallel computing.
+%
+%   insolation = computeInsolationGrid_parallel(datetime_val, latGrid, lonGrid, time_zone, rotation, dst)
+%
+%   Inputs:
+%       datetime_val : Acquisition time in datenum format
+%       latGrid      : Latitude matrix (degrees)
+%       lonGrid      : Longitude matrix (degrees)
+%       time_zone    : Time zone offset (hours)
+%       rotation     : System rotation (degrees)
+%       dst          : Daylight saving time flag (true/false)
+%
+%   Output:
+%       insolation   : Matrix of the same size as latGrid, containing insolation in W/m²
+%
+% The model used is a simple approximation:
+%   I = I0 * cosd(zenith)  for daytime pixels (zenith < 90°)
+%   I = 0                  for nighttime pixels
+
+    % Solar constant
+    I0 = 1367; % W/m²
+
+    [nRows, nCols] = size(latGrid);
+    insolation = zeros(nRows, nCols);
+
+    % Parallelized loop processing each row independently
+    parfor i = 1:nRows
+        % Temporary row storage
+        tempRow = zeros(1, nCols);
+        for j = 1:nCols
+            % Compute solar position for pixel (i, j)
+            [angles, ~] = solarPosition(datetime_val, latGrid(i,j), lonGrid(i,j), time_zone, rotation, dst);
+            zenith = angles(1);  % Zenith angle in degrees
+
+            if zenith < 90
+                tempRow(j) = I0 * cosd(zenith);
+            else
+                tempRow(j) = 0; % Nighttime pixel
+            end
+        end
+        % Assign the computed row back to the output matrix
+        insolation(i, :) = tempRow;
+    end
+
+end
+%--------------------------------------------------------------------------
+
+function [angles,projection] = solarPosition(datetime,latitude,longitude, ...
+                                             time_zone,rotation,dst)
+%SOLARPOSITION Calculate solar position using most basic algorithm
+%   This is the most basic algorithm. It is documented in Seinfeld &
+%   Pandis, Duffie & Beckman and Wikipedia.
+%
+% [ANGLES,PROJECTION] = SOLARPOSITION(DATE,TIME,LATITUDE,LONGITUDE,TIME_ZONE)
+% returns ZENITH & AZIMUTH for all DATE & TIME pairs at LATITUDE, LONGITUDE.
+% ANGLES = [ZENITH,AZIMUTH] and PROJECTION = [PHI_X, PHI_Y]
+% PHI_X is projection on x-z plane & PHI_Y is projection on y-z plane.
+% DATETIME can be string, vector [YEAR, MONTH, DAY, HOURS, MINUTES, SECONDS],
+%   cellstring or matrix N x [YEAR, MONTH, DAY, HOURS, MINUTES, SECONDS] for N
+%   times.
+% LATITUDE [degrees] and LONGITUDE [degrees] are the coordinates of the site.
+% TIME_ZONE [hours] of the site.
+% ROTATION [degrees] clockwise rotation of system relative to north.
+% DST [logical] flag for daylight savings time, typ. from March to November
+%   in the northern hemisphere.
+%
+% References:
+% http://en.wikipedia.org/wiki/Solar_azimuth_angle
+% http://en.wikipedia.org/wiki/Solar_elevation_angle
+%
+% Mark A. Mikofski
+% Copyright (c) 2013
+%
+%% datetime
+if iscellstr(datetime) || ~isvector(datetime)
+    datetime = datenum(datetime); % [days] dates & times
+else
+    datetime = datetime(:); % convert datenums to row
+end
+date = floor(datetime); % [days]
+[year,~,~] = datevec(date);
+time = datetime - date; % [days]
+%% constants
+toRadians = @(x)x*pi/180; % convert degrees to radians
+toDegrees = @(x)x*180/pi; % convert radians to degrees
+%% Equation of time
+d_n = mod(date-datenum(year,1,1)+1,365); % day number
+B = 2*pi*(d_n-81)/365; % ET parameter
+ET = 9.87*sin(2*B)-7.53*cos(B)-1.5*sin(B); % [minutes] equation of time
+% approximate solar time
+solarTime = ((time*24-double(dst))*60+4*(longitude-time_zone*15)+ET)/60/24;
+latitude_rad = toRadians(latitude); % [radians] latitude
+rotation_rad = toRadians(rotation); % [radians] field rotation
+t_h = (solarTime*24-12)*15; % [degrees] hour angle
+t_h_rad = toRadians(t_h); % [radians]
+delta = -23.45 * cos(2*pi*(d_n+10)/365); % [degrees] declination
+delta_rad = toRadians(delta); % [radians]
+theta_rad = acos(sin(latitude_rad)*sin(delta_rad)+ ...
+    cos(latitude_rad)*cos(delta_rad).*cos(t_h_rad)); % [radians] zenith
+theta = toDegrees(theta_rad); % [degrees] zenith
+elevation = 90 - theta; % elevation
+day = elevation>0; % day or night?
+cos_phi = (cos(theta_rad)*sin(latitude_rad)- ...
+    sin(delta_rad))./(sin(theta_rad)*cos(latitude_rad)); % cosine(azimuth)
+% azimuth [0, 180], absolute value measured from due south, so east = west = 90,
+% south = 0, north = 180
+phi_south = acos(min(1,max(-1,cos_phi)));
+% azimuth [0, 360], measured clockwise from due north, so east = 90,
+% south = 180, and west = 270 degrees
+phi_rad = NaN(size(phi_south)); % night azimuth is NaN
+% shift from ATAN to ATAN2, IE: use domain from 0 to 360 degrees instead of
+% from -180 to 180
+phi_rad(day) = pi + sign(t_h(day)).*phi_south(day); % Shift domain to 0-360 deg
+% projection of sun angle on x-z plane, measured from z-direction (up)
+phi_x = toDegrees(atan2(sin(phi_rad-rotation_rad).*sin(theta_rad), ...
+    cos(theta_rad))); % [degrees]
+% projection of sun angle on y-z plane, measured from z-direction (up)
+phi_y = toDegrees(atan2(cos(phi_rad-rotation_rad).*sin(theta_rad), ...
+    cos(theta_rad))); % [degrees]
+phi = toDegrees(phi_rad); % [degrees] azimuth
+angles = [theta, phi]; % [degrees] zenith, azimuth
+projection = [phi_x,phi_y]; % [degrees] x-z plane, y-z plane
+end
+
 %==========================================================================
