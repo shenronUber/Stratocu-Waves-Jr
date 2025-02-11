@@ -7,3 +7,10 @@ downloaded_data/IR/OR_ABI-L2-CMIPF-M6C13_G16_s20232440050205_e20232440059524_c20
 *.fig
 *.asv
 *.mj2
+WIP_PairWavelets.m
+WIP_PairWavelet_SameInstrument.m
+Wave_Statistics_BoxDataOld.m
+Speed_Calculation_old.m
+SingleFrameWaveletCode_Old.m
+MultiInstrument_CrossWavelet_Old.m
+BoxDataRetrieval_Old.m
