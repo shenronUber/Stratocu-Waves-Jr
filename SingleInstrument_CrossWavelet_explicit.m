@@ -18,6 +18,10 @@ endDate   = datetime(2023, 10, 12, 9, 0, 0); % End of processing period
 rootSepacDir = 'C:\Users\admin\Box\GWaves_2023_10_11-14_SEPAC';
 sourceRoot   = 'C:\Users\admin\Box\GOES2go_satellite_downloads';  % (Used in renaming)
 
+% Brian version 
+%rootSepacDir = '/Users/bmapes/Box/GWaves_2023_10_11-14_SEPAC';
+%sourceRoot   = '/Users/bmapes/Box/GOES2go_satellite_downloads';  % (Used in renaming)
+
 %----------- INSTRUMENT SETTINGS ----------------------------
 % (Here we process only one instrument; change as needed)
 instrument = 'IR';  % Choose 'IR' or 'VIS'
