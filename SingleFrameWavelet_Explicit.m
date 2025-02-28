@@ -69,7 +69,7 @@ window_buffer          = 10;   % [Used to avoid edges. We keep an inner region b
 square_size_deg        = 5;    % [Used to define about 5° squares. This is converted to px for partitioning]
 
 % ----------- IR PREPROCESSING THRESHOLDS ---------------------------------
-IR_threshold           = 275;  % [Used in preprocessFrame for IR. Values < 275 => set to NaN -> then filled]
+IR_threshold           = 280;  % [Used in preprocessFrame for IR. Values < 275 => set to NaN -> then filled]
 IR_fillPercentile      = 50;   % [Used after IR_threshold masking. We fill masked areas with this percentile of final data]
 
 % ----------- VIS PREPROCESSING THRESHOLDS --------------------------------
@@ -151,7 +151,7 @@ for f_idx = 1 : num_frames
     % Read raw data
     data = double(ncread(fullfile(boxRootDir, fileName), variableName));
     fullPath = fullfile(boxRootDir, fileName);
-
+%%
     % Preprocess (IR or VIS)
     data_pro = preprocessFrame(data, dataType, ...
         methodName,fullPath,fileTime, ...
@@ -179,7 +179,7 @@ for f_idx = 1 : num_frames
                 warning('Unknown window type: %s. No window applied.', windowType);
         end
     end
-
+%%
     %----------------------------------------------------------------------
     % 3b) BUILD SQUARES (ROI PARTITION)
     %----------------------------------------------------------------------
@@ -534,39 +534,53 @@ end
 %--------------------------------------------------------------------------
 
 function data_win = applyRadialWindow(data_in, radius_factor, decay_rate)
-% APPLYRADIALWINDOW
-%  Creates a radial decay window from the center outwards.
-%  radius_factor: fraction of half-min-dimension
-%  decay_rate   : controls the steepness of the decay
-
+    % Compute global median of the input data
+    median_val = median(data_in(:));
+    
+    % Prepare coordinate system
     [rows, cols] = size(data_in);
-    cx = cols/2; 
+    cx = cols/2;
     cy = rows/2;
     [X, Y] = meshgrid(1:cols, 1:rows);
+    
+    % Radial distance from center
     R = sqrt((X - cx).^2 + (Y - cy).^2);
-
-    maxR  = radius_factor * min(cx, cy);
+    
+    % Maximum radius
+    maxR = radius_factor * min(cx, cy);
+    
+    % Compute window values using a logistic function
     window = 1 ./ (1 + exp(decay_rate * (R - maxR)));
-    data_win = data_in .* window;
+    
+    % Instead of simply data_in .* window, blend with the median:
+    %   - Where window = 1, output ~ data_in
+    %   - Where window = 0, output ~ median_val
+    data_win = window .* data_in + (1 - window) .* median_val;
 end
 %--------------------------------------------------------------------------
 
 function data_win = applyRectangularWindow(data_in, radius_factor, decay_rate)
-% APPLYRECTANGULARWINDOW
-%  Similar concept to radial, but applies a "rectangular" or Chebyshev-based
-%  radial decay, effectively generating a window that corners-off the edges.
-
+    % Compute global median of the input data
+    median_val = median(data_in(:));
+    
+    % Prepare coordinate system
     [rows, cols] = size(data_in);
-    cx = cols/2; 
+    cx = cols/2;
     cy = rows/2;
     [X, Y] = meshgrid(1:cols, 1:rows);
     
-    dx = abs(X - cx)/cx;  
-    dy = abs(Y - cy)/cy;  
-    R = max(dx, dy);  
+    % Normalized absolute distances from center
+    dx = abs(X - cx) / cx;
+    dy = abs(Y - cy) / cy;
+    
+    % R is the "rectangular" distance metric, i.e. the maximum of dx, dy
+    R = max(dx, dy);
+    
+    % Compute window values using a logistic function
     window = 1 ./ (1 + exp(decay_rate * (R - radius_factor)));
     
-    data_win = data_in .* window;
+    % Blend data_in with the median (instead of fading to zero):
+    data_win = window .* data_in + (1 - window) .* median_val;
 end
 %--------------------------------------------------------------------------
 

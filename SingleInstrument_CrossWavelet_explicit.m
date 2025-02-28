@@ -48,7 +48,7 @@ square_size_deg = 5;        % Square size (in degrees) for ROI partitioning
 
 %----------- PREPROCESSING THRESHOLDS -----------------------
 % For IR
-IR_threshold = 275;         % IR threshold: values below are set to NaN
+IR_threshold = 280;         % IR threshold: values below are set to NaN
 IR_fillPercentile = 50;     % Fill IR masked pixels with this percentile
 % For VIS (not used if processing only IR, but kept for consistency)
 VIS_lowerPercentile = 10;   % VIS lower bound (percentile)
@@ -487,27 +487,53 @@ end
 %--------------------------------------------------------------------------
 
 function data_win = applyRadialWindow(data_in, radius_factor, decay_rate)
+    % Compute global median of the input data
+    median_val = median(data_in(:));
+    
+    % Prepare coordinate system
     [rows, cols] = size(data_in);
     cx = cols/2;
     cy = rows/2;
     [X, Y] = meshgrid(1:cols, 1:rows);
+    
+    % Radial distance from center
     R = sqrt((X - cx).^2 + (Y - cy).^2);
+    
+    % Maximum radius
     maxR = radius_factor * min(cx, cy);
+    
+    % Compute window values using a logistic function
     window = 1 ./ (1 + exp(decay_rate * (R - maxR)));
-    data_win = data_in .* window;
+    
+    % Instead of simply data_in .* window, blend with the median:
+    %   - Where window = 1, output ~ data_in
+    %   - Where window = 0, output ~ median_val
+    data_win = window .* data_in + (1 - window) .* median_val;
 end
 %--------------------------------------------------------------------------
 
 function data_win = applyRectangularWindow(data_in, radius_factor, decay_rate)
+    % Compute global median of the input data
+    median_val = median(data_in(:));
+    
+    % Prepare coordinate system
     [rows, cols] = size(data_in);
     cx = cols/2;
     cy = rows/2;
     [X, Y] = meshgrid(1:cols, 1:rows);
-    dx = abs(X - cx)/cx;
-    dy = abs(Y - cy)/cy;
+    
+    % Normalized absolute distances from center
+    dx = abs(X - cx) / cx;
+    dy = abs(Y - cy) / cy;
+    
+    % R is the "rectangular" distance metric, i.e. the maximum of dx, dy
     R = max(dx, dy);
+    
+    % Compute window values using a logistic function
     window = 1 ./ (1 + exp(decay_rate * (R - radius_factor)));
-    data_win = data_in .* window;
+    
+    % Blend data_in with the median (instead of fading to zero):
+    data_win = window .* data_in + (1 - window) .* median_val;
 end
 %--------------------------------------------------------------------------
 
