@@ -9,16 +9,13 @@
 % windowing, preprocessing, etc.) are defined in the "Variables Setup" section.
 
 %% 1) VARIABLES SETUP
-%----------- DATE/TIME SETTINGS ---------------------------
-startDate = datetime(2023, 10, 12, 1, 0, 0); % start processing time
-endDate   = datetime(2023, 10, 12, 3, 30, 0); % end processing time
 
 %----------- FOLDER/PATH SETTINGS ---------------------------
-rootSepacDir = 'C:\Users\admin\Box\GWaves_2023_10_11-14_SEPAC';
-sourceRoot   = 'C:\Users\admin\Box\GOES2go_satellite_downloads';  % (Used in renaming)
+rootSepacDir = 'C:\Users\admin\Box\GWaves_2023_10_11-14_SEPAC\syn_u10_200km_warp_mod3';
+outDir = 'C:\Users\admin\Box\GWaves_2023_10_11-14_SEPAC\syn_u10_200km_warp_mod3\Results';
 
 %----------- INSTRUMENT SETTINGS ----------------------------
-instrument = 'IR';  % Choose 'IR' or 'VIS'
+instrument = 'VIS';  % Choose 'IR' or 'VIS'
 
 %----------- SPATIAL SCALING & RESIZING --------------------
 degrees_per_pixel = 0.04;     % Degrees per pixel (typical for GOES)
@@ -34,7 +31,7 @@ Scales = [2, 4, 8, 16, 32, 64, 128];       % Wavelet scales in pixel units
 NANGLES = numel(Angles);                  % Number of angles
 NSCALES = numel(Scales);                  % Number of scales
 
-CustomWavelet = false;  % This flag indicates whether to use a custom (elliptical) wavelet instead of the default built-in one.
+CustomWavelet = true;  % This flag indicates whether to use a custom (elliptical) wavelet instead of the default built-in one.
 coneAngle = pi/6;      % The variable coneAngle specifies the angular extent of the directional mask and influences the wavelet's sensitivity to orientation.
 sigmaX = 0.05;         % The parameter sigmaX defines the decay rate of the wavelet's envelope along the horizontal frequency axis (ωX), affecting its horizontal resolution.
 sigmaY = 1.95;         % The parameter sigmaY defines the decay rate of the wavelet's envelope along the vertical frequency axis (ωY), affecting its vertical resolution.
@@ -99,12 +96,12 @@ coherencePoolSize = poolSize; % Use the same pooling for coherence computations
 SpeedPoolSize = poolSize;     % Use the same pooling for speed computations
 
 %----------- SYNTHETIC DATA SETTINGS ----------------------
-syntheticWaveMode = true;   % If true, superimpose a synthetic wave on a fixed base image
-driftMode         = true;   % If true, apply a drift shift each frame using circshift
+syntheticWaveMode = false;   % If true, superimpose a synthetic wave on a fixed base image
+driftMode         = false;   % If true, apply a drift shift each frame using circshift
 
 % Drift parameters (in m/s) rather than pixels/frame:
-drift_speed_m_s = 10;       % e.g. 10 m/s
-driftAngleDeg   = 45+90;       % e.g. 45 degrees (0 = right, 90 = up) // the image is inverted !!
+drift_speed_m_s = 25;       % e.g. 10 m/s
+driftAngleDeg   = 45;       % e.g. 45 degrees (0 = right, 90 = up) // the image is inverted !!
 
 % Parameters for the synthetic wave:
 cphase = 15;                   % Phase speed (m/s)
@@ -112,7 +109,6 @@ wavelength = 150e3;            % Wavelength in meters
 direction = 235;               % Propagation direction in degrees
 zamplitude = 100;              % Vertical amplitude (m)
 PBLdepth = 1000;               % Boundary layer depth (m)
-dB_dzPBL = 0.1;                  % dB / (dZ/PBLdepth) | Change of brightness with zamplitude
 
 
 % Parameters for the spatial amplitude window (wave packet)
@@ -138,20 +134,36 @@ DXFactor = 1/4;
 % Seconds between frames (important for drift or wave stepping)
 time_resolution = 1800;
 
-%% 2) RETRIEVE FILE LIST
-% Raw data is assumed to be in:
-%    <rootSepacDir>\INSTRUMENT\Data
-dataDir = fullfile(rootSepacDir, upper(instrument), 'Data');
-if ~exist(dataDir, 'dir')
-    error('Data directory for %s not found: %s', instrument, dataDir);
-end
-[fNames, fTimes, varName] = getDateRangeFiles(dataDir, startDate, endDate);
-numFrames = numel(fTimes);
-if numFrames == 0
-    fprintf('No frames found for %s in the given time period.\n', instrument);
-    return;
-end
-fprintf('Found %d frames for instrument %s.\n', numFrames, instrument);
+ %% 2) GATHER PNG FILES
+    if ~exist(rootSepacDir, 'dir')
+        error('Folder does not exist: %s', rootSepacDir);
+    end
+    pngFiles = dir(fullfile(rootSepacDir, '*.png'));
+    if isempty(pngFiles)
+        fprintf('No PNG images found in %s\n', rootSepacDir);
+        return;
+    end
+
+    % Let’s extract possible date/time from the filename, else fallback on file datenum
+    fileInfos = [];
+    for iF = 1:numel(pngFiles)
+        fn    = pngFiles(iF).name;
+        fpath = fullfile(rootSepacDir, fn);
+        t = tryExtractDateFromFilename(fn);
+        if isnat(t)
+            % fallback: use file's datenum
+            t = datetime(pngFiles(iF).datenum, 'ConvertFrom','datenum');
+        end
+        fileInfos(end+1).fname = fn;
+        fileInfos(end).fdate   = t;
+        fileInfos(end).fpath   = fpath;
+    end
+    % Sort by date
+    [~, idxSort] = sort([fileInfos.fdate]);
+    fileInfos    = fileInfos(idxSort);
+    
+    numFrames = numel(pngFiles);
+    fprintf('Found %d frames for instrument %s.\n', numFrames, instrument);
 
 %% 3) MAIN PROCESSING LOOP (Single instrument + cross–temporal coherence)
 prevWaveletSpec = [];  % For coherence computation
@@ -174,22 +186,26 @@ SpeedPairCount = 0;
 SpeedBatchNumber = 0;
 
 for f_idx = 1:numFrames
-    thisTime = fTimes(f_idx);
+
+    thisFileName = fileInfos(f_idx).fname;
+    thisFullPath = fileInfos(f_idx).fpath;
+    thisTime     = fileInfos(f_idx).fdate;
+    
     frameDateStr = datestr(thisTime, 'yyyy_mm_dd_HHMMSS');
-    fprintf('\nProcessing frame [%d/%d]: %s\n', f_idx, numFrames, frameDateStr);
+    fprintf('\nFrame [%d/%d]: %s\n', f_idx, numel(fileInfos), frameDateStr);
     
-    % Define output folder for single-frame wavelet results.
-    %singleOutDir = fullfile(rootSepacDir, upper(instrument), 'Wavelet_Results', sprintf('Frame_%s', frameDateStr));
-    singleOutDir = fullfile(rootSepacDir, 'Test');
+    singleOutDir = fullfile(outDir, 'PerFrame');
     if ~exist(singleOutDir, 'dir')
-        mkdir(singleOutDir);
+    mkdir(singleOutDir);
     end
-    singleNcFile = fullfile(singleOutDir, sprintf('FrameWavelet_%s.nc', frameDateStr));
-    
-    % Read raw data.
-    thisFileName = fNames{f_idx};
-    thisFullPath = fullfile(dataDir, thisFileName);
-    data = double(ncread(thisFullPath, varName));
+
+    % READ THE PNG as double precision (range ~[0,1] if 8-bit):
+    rawImg = imread(thisFullPath);
+    if ndims(rawImg) == 3
+        % If it's RGB, convert to grayscale
+        rawImg = rgb2gray(rawImg);
+    end
+    data = double(rawImg) / 255;  % scale to [0..1], or remove /255 if your images are already [0..1]
 
     % -- On the first frame, store it as the base image for reference --
     if f_idx == 1  
@@ -242,7 +258,7 @@ for f_idx = 1:numFrames
         % Warp the fixed base image:
         warped_img = interp2(X, Y, base_frame, XI, YI, 'linear', 0);
         % Modulate brightness with the vertical displacement (dz):
-        modulated_img = warped_img .* (1 + dz / PBLdepth * dB_dzPBL);
+        modulated_img = warped_img .* (1 + dz / PBLdepth * 5);
         
         % Use the resulting image as the data for further processing:
         data = modulated_img;
@@ -581,7 +597,7 @@ for f_idx = 1:numFrames
         roseFileName = fullfile(singleOutDir, sprintf('Global_PowerWaveRose_Overlay_%d.png', batchNumber));
         fprintf('Saving wave–rose plot to: %s\n', roseFileName);
         exportgraphics(fig, roseFileName, 'Resolution', 400);
-        
+
         % Reset the batch counter.
         batchFrameCount = 0;
     end
@@ -671,8 +687,8 @@ for f_idx = 1:numFrames
             
             roseFileName = fullfile(singleOutDir, sprintf('Global_CoherenceWaveRose_Overlay_%d.png', batchNumber));
             fprintf('Saving wave–rose plot to: %s\n', roseFileName);
-            exportgraphics(fig, roseFileName, 'Resolution', 400);
-            
+            exportgraphics(fig, roseFileName, 'Resolution', 400);               
+                 
             % Reset the coherence batch counter.
             coherencePairCount = 0;
         end
@@ -1850,6 +1866,32 @@ phi_y = toDegrees(atan2(cos(phi_rad-rotation_rad).*sin(theta_rad), ...
 phi = toDegrees(phi_rad); % [degrees] azimuth
 angles = [theta, phi]; % [degrees] zenith, azimuth
 projection = [phi_x,phi_y]; % [degrees] x-z plane, y-z plane
+end
+
+function dt = tryExtractDateFromFilename(fn)
+% Attempts to parse a date/time substring like "2023_10_12_013000" from the filename.
+    expr = '(\d{4})_(\d{2})_(\d{2})_(\d{6})';
+    mt   = regexp(fn, expr, 'tokens', 'once');
+    if isempty(mt)
+        dt = NaT;
+        return;
+    end
+    yyyy = str2double(mt{1});
+    mm   = str2double(mt{2});
+    dd   = str2double(mt{3});
+    HHMMSS = mt{4};
+    if length(HHMMSS) == 6
+        HH = str2double(HHMMSS(1:2));
+        MN = str2double(HHMMSS(3:4));
+        SS = str2double(HHMMSS(5:6));
+    else
+        HH=0; MN=0; SS=0;
+    end
+    try
+        dt = datetime(yyyy, mm, dd, HH, MN, SS);
+    catch
+        dt = NaT;
+    end
 end
 
 %==========================================================================
