@@ -88,15 +88,8 @@ ArrayMode           = 'percentile'; % 'percentile' or 'absolute'
 saverose = true;            % Flag to save the wave–rose image
 DisplayValuePower = 4*10^-3.5;
 DisplayValueCoherence = 1;
+DisplayValuePhase = [-pi/2;pi/2];
 DisplayValueSpeed = [-30;30];
-
-%----------- POOLING SETTINGS -------------------------------
-poolSize = 6;               % Number of frames to accumulate per batch for aggregation
-% (e.g., if 12 frames are processed and poolSize = 6, two batches will be computed)
-
-%----------- COHERENCE POOLING (for cross–temporal coherence) --
-coherencePoolSize = poolSize; % Use the same pooling for coherence computations
-SpeedPoolSize = poolSize;     % Use the same pooling for speed computations
 
 %----------- SYNTHETIC DATA SETTINGS ----------------------
 syntheticWaveMode = true;   % If true, superimpose a synthetic wave on a fixed base image
@@ -134,7 +127,6 @@ packet_width_y = 300e3;
 %   - DXFactor = 4 means the wave features are shrunk, appearing 4x smaller.
 DXFactor = 1/4;  
 
-
 % Seconds between frames (important for drift or wave stepping)
 time_resolution = 1800;
 
@@ -154,62 +146,58 @@ end
 fprintf('Found %d frames for instrument %s.\n', numFrames, instrument);
 
 %% 3) MAIN PROCESSING LOOP (Single instrument + cross–temporal coherence)
-prevWaveletSpec = [];  % For coherence computation
+%    Rewritten to accumulate sums over the entire domain first.
 
-% Initialize pooling variables for single–frame wave–rose online average.
-% currentBatchWaveroseAvg is a cell array [num_squares_y x num_squares_x] 
-% that holds the running average for the current pooling batch.
-currentBatchWaveroseAvg = [];
-batchFrameCount = 0;  % Number of frames processed in the current batch
-batchNumber = 0;      % Pooling batch index
+% 3A) Allocate accumulators for single–frame wave–rose (i.e., power) 
+%     and for cross–temporal coherence. We accumulate across all frames.
+[rowsF, colsF] = deal([]);  % Will be set after first frame is processed
+power_sum = [];             % For sum of |spec_full|^2  across frames
+crossSpec_sum = [];         % For sum of (B1 * conj(B2)) across frame pairs
+B1_auto_sum   = [];         % For sum of |B1|^2
+B2_auto_sum   = [];         % For sum of |B2|^2
+phaseExp_sum = [];
 
-% Similarly, initialize pooling variables for coherence and speed.
-currentCoherenceBatchAvg = [];
-currentPhaseDiffBatchAvg = [];
-
-coherencePairCount = 0;
-coherenceBatchNumber = 0;
-
-SpeedPairCount = 0;
-SpeedBatchNumber = 0;
+prevWaveletSpec = [];  % Will store wavelet from previous frame for cross–temporal coherence
 
 for f_idx = 1:numFrames
+    % ---- Prepare basic info about this frame ----
     thisTime = fTimes(f_idx);
     frameDateStr = datestr(thisTime, 'yyyy_mm_dd_HHMMSS');
     fprintf('\nProcessing frame [%d/%d]: %s\n', f_idx, numFrames, frameDateStr);
-    
-    % Define output folder for single-frame wavelet results.
-    %singleOutDir = fullfile(rootSepacDir, upper(instrument), 'Wavelet_Results', sprintf('Frame_%s', frameDateStr));
+
+    % (Optional) define an output dir per frame, 
+    % but we’re no longer doing per‐frame ROI wave–rose.
     singleOutDir = fullfile(rootSepacDir, 'Test');
     if ~exist(singleOutDir, 'dir')
         mkdir(singleOutDir);
     end
     singleNcFile = fullfile(singleOutDir, sprintf('FrameWavelet_%s.nc', frameDateStr));
-    
-    % Read raw data.
+
+    % ---- Read the raw data from file ----
     thisFileName = fNames{f_idx};
     thisFullPath = fullfile(dataDir, thisFileName);
     data = double(ncread(thisFullPath, varName));
 
-    % -- On the first frame, store it as the base image for reference --
-    if f_idx == 1  
+    % ---- On the first frame, store base_frame & possibly precompute synthetic-wave grids ----
+    if f_idx == 1
         base_frame = data;
-        
-        % If we want wave geometry, we also precompute mesh for X,Y, etc.
+
         if syntheticWaveMode
             [rowsF, colsF] = size(base_frame);
             [X, Y] = meshgrid(1:colsF, 1:rowsF);
-            % Convert to real distances (if needed):
-            DX = 1000 * pixel_size_km * DXFactor;  % e.g. if pixel_size_km is 8.9 => DX ~ 8900*DXFactor m/pixel
+
+            % Real‐world pixel size (m), factoring in DXFactor:
+            DX = 1000 * pixel_size_km * DXFactor;
             Xm = (X - mean(X(:))) * DX;
-            Ym = (Y - mean(Y(:))) * DX * -1; % negative if you want Y increasing downward
+            Ym = (Y - mean(Y(:))) * DX * -1;  % negative if Y runs downward
         end
-        
-    elseif syntheticWaveMode | driftMode  
-        % We start with the base frame on subsequent frames:
+
+    elseif syntheticWaveMode || driftMode
+        % If doing synthetic wave or drift, start from the same base frame each iteration:
         data = base_frame;
     end
 
+    % ---- Synthetic wave injection (if enabled) ----
     if syntheticWaveMode
         % Compute wave parameters
         k = (2 * pi / wavelength) * cosd(direction);
@@ -248,6 +236,7 @@ for f_idx = 1:numFrames
         data = modulated_img;
     end
 
+    % ---- Drift shift (if enabled) ----
     if driftMode && f_idx > 1
         % Determine how many meters the image should shift in the time between frames:
         driftDistance_m = drift_speed_m_s * time_resolution* (f_idx - 1);  % e.g. 10 m/s * 1800 s = 18000 m
@@ -270,512 +259,339 @@ for f_idx = 1:numFrames
         % circshift( data, [row_shift, column_shift] )
         data = circshift(data, [shift_dy, shift_dx]);
     end
-
-    % Preprocess the data.
+%%
+    % ---- Preprocessing (thresholds, highpass, etc.) ----
     data_pre = preprocessFrame(data, instrument, methodName, ...
-        thisFullPath, thisTime, IR_threshold, IR_fillPercentile, ...
-        VIS_lowerPercentile, VIS_upperPercentile, ...
-        VIS_fillPercentile, clipMinHP, clipMaxHP, ...
-        lowPassFilterWidth_20, lowPassFilterWidth_50, lowPassFilterWidth_100,Insolation_Correction);
-
-    data_filt = data_pre;  % Keep a copy for annotations.
-
-    figure
-    imagesc(data_filt)
-    colormap(gray)
-    
-    % Resize if needed.
+                thisFullPath, thisTime, ...
+                IR_threshold, IR_fillPercentile, ...
+                VIS_lowerPercentile, VIS_upperPercentile, ...
+                VIS_fillPercentile, clipMinHP, clipMaxHP, ...
+                lowPassFilterWidth_20, lowPassFilterWidth_50, lowPassFilterWidth_100, ...
+                Insolation_Correction);
+%%
+    % ---- Resize or window if needed ----
     if shrinkfactor ~= 1
         data_pre = imresize(data_pre, invshrinkfactor);
     end
-    
-    % Apply windowing if enabled.
     if doWindow
         switch lower(windowType)
             case 'radial'
                 data_pre = applyRadialWindow(data_pre, radius_factor, decay_rate);
-                data_filt = applyRadialWindow(data_filt, radius_factor, decay_rate);
             case 'rectangular'
                 data_pre = applyRectangularWindow(data_pre, radius_factor, decay_rate);
-                data_filt = applyRectangularWindow(data_filt, radius_factor, decay_rate);
-            otherwise
-                warning('Unknown window type: %s. No window applied.', windowType);
         end
-    end    
-    
+    end
+
+    % Determine the final 2D size (post‐resize):
     [rowsF, colsF] = size(data_pre);
 
-    % Compute the 2D wavelet transform.
+    % ---- Compute wavelet transform on this processed frame ----
     if CustomWavelet
-        waveStruct = barebonesCauchy2D_Elliptical_NoShift(data_pre, Scales, Angles, ...
-        coneAngle, sigmaX, sigmaY, alpha);
+        waveStruct = barebonesCauchy2D_Elliptical_NoShift( ...
+                         data_pre, Scales, Angles, ...
+                         coneAngle, sigmaX, sigmaY, alpha);
     else
-        waveStruct = cwtft2(data_pre, 'wavelet', 'cauchy', 'scales', Scales, 'angles', Angles);
+        waveStruct = cwtft2(data_pre, ...
+                            'wavelet','cauchy', ...
+                            'scales', Scales, ...
+                            'angles', Angles);
     end
 
-    spec_full = squeeze(waveStruct.cfs);  % Dimensions: [Ny, Nx, NSCALES, NANGLES]
+    % cfs: size [rowsF, colsF, NSCALES, NANGLES]
+    spec_full = squeeze(waveStruct.cfs);
+
+    % Optional amplitude scaling by 2/scale:
     for iS = 1:NSCALES
-        spec_full(:,:,iS,:) = spec_full(:,:,iS,:) * (2/Scales(iS));
-    end
-    
-    % Build ROI squares (only once on the first frame).
-    if f_idx == 1
-        x_buffer_range = (window_buffer+1):(colsF-window_buffer);
-        y_buffer_range = (window_buffer+1):(rowsF-window_buffer);
-        adjusted_frame_width = length(x_buffer_range);
-        adjusted_frame_height = length(y_buffer_range);
-        square_size_px = round(square_size_deg / degrees_per_pixel);
-        num_squares_x = ceil(adjusted_frame_width / square_size_px);
-        num_squares_y = ceil(adjusted_frame_height / square_size_px);
-        squares = [];
-        idxS = 1;
-        for iy = 1:num_squares_y
-            for ix = 1:num_squares_x
-                x_start = floor((ix - 1) * adjusted_frame_width / num_squares_x) + 1;
-                y_start = floor((iy - 1) * adjusted_frame_height / num_squares_y) + 1;
-                x_end = floor(ix * adjusted_frame_width / num_squares_x);
-                y_end = floor(iy * adjusted_frame_height / num_squares_y);
-                if x_end > x_start && y_end > y_start
-                    squares(idxS).x_range = x_buffer_range(x_start:x_end);
-                    squares(idxS).y_range = y_buffer_range(y_start:y_end);
-                    squares(idxS).index = idxS;
-                    idxS = idxS + 1;
-                end
-            end
-        end
-        
-        % Retrieve number of scales and angles from spec_full.
-        [~, ~, nScales, nAngles] = size(spec_full);
-    end
-    
-    % ---- SINGLE-FRAME WAVELET AGGREGATION (for Pooling) ----
-    % Update the running average for the current pooling batch.
-    batchFrameCount = batchFrameCount + 1;
-    if batchFrameCount == 1
-        % Initialize the current batch running average container as a cell array.
-        currentBatchWaveroseAvg = cell(num_squares_y, num_squares_x);
-    end
-    
-    for iy = 1:num_squares_y
-        for ix = 1:num_squares_x
-            % Determine local indices for the current square.
-            x_start = floor((ix - 1) * adjusted_frame_width / num_squares_x) + 1;
-            x_end = floor(ix * adjusted_frame_width / num_squares_x);
-            y_start = floor((iy - 1) * adjusted_frame_height / num_squares_y) + 1;
-            y_end = floor(iy * adjusted_frame_height / num_squares_y);
-            % Extract the corresponding region from spec_full.
-            square_region = spec_full(y_buffer_range(y_start:y_end), ...
-                                       x_buffer_range(x_start:x_end), :, :);
-            % Compute the local power spectrum (average spatially).
-            power_square = abs(square_region).^2;
-            innerpower_square = squeeze(mean(mean(power_square, 1, 'omitnan'), 2, 'omitnan'));  % [nScales, nAngles]
-            
-            if ~exist('maxAllPower', 'var')
-                maxAllPower = 0;
-            end
-            currentMax = max(innerpower_square(:));
-            if currentMax > maxAllPower
-                maxAllPower = currentMax;
-            end
-
-            % Update running average using the online update formula.
-            if batchFrameCount == 1
-                currentBatchWaveroseAvg{iy, ix} = innerpower_square;
-            else
-                currentBatchWaveroseAvg{iy, ix} = currentBatchWaveroseAvg{iy, ix} + ...
-                    (innerpower_square - currentBatchWaveroseAvg{iy, ix}) / batchFrameCount;
-            end
-        end
+        spec_full(:,:,iS,:) = spec_full(:,:,iS,:) * (2 / Scales(iS));
     end
 
-    % ---- CROSS-TEMPORAL COHERENCE COMPUTATION ----
+    % ---- Init accumulators if this is the first time we know rowsF, colsF ----
+    if isempty(power_sum)
+        power_sum      = zeros(rowsF, colsF, NSCALES, NANGLES, 'like', spec_full);
+        crossSpec_sum  = zeros(rowsF, colsF, NSCALES, NANGLES, 'like', spec_full);
+        B1_auto_sum    = zeros(rowsF, colsF, NSCALES, NANGLES, 'like', spec_full);
+        B2_auto_sum    = zeros(rowsF, colsF, NSCALES, NANGLES, 'like', spec_full);
+
+        % For phase difference averaging:
+        phaseExp_sum   = zeros(rowsF, colsF, NSCALES, NANGLES, 'like', spec_full) + 0i;
+    end
+
+    % ---- Accumulate single‐frame wave–rose (power) sums ----
+    power_sum = power_sum + abs(spec_full).^2;
+
+    %--- Cross-temporal stuff only if we have a previous frame ---
     if ~isempty(prevWaveletSpec)
-        % Compute the complex cross–wavelet product between previous and current frame.
         crossSpec_product = prevWaveletSpec .* conj(spec_full);
-        phase_diff_temp = angle(crossSpec_product);
-        
-        % For coherence and speed, we use the same ROI partitioning.
-        crossSpec_avg = zeros(num_squares_y, num_squares_x, nScales, nAngles);
-        phase_diff_avg = zeros(num_squares_y, num_squares_x, nScales, nAngles);
-        
-        for iy = 1:num_squares_y
-            for ix = 1:num_squares_x
-                x_start = floor((ix - 1) * adjusted_frame_width / num_squares_x) + 1;
-                x_end   = floor(ix * adjusted_frame_width / num_squares_x);
-                y_start = floor((iy - 1) * adjusted_frame_height / num_squares_y) + 1;
-                y_end   = floor(iy * adjusted_frame_height / num_squares_y);
-                
-                % Define the ROI for the spatial dimensions:
-                roi_rows = y_buffer_range(y_start:y_end);
-                roi_cols = x_buffer_range(x_start:x_end);
-                
-                % --- New Numerator ---
-                % Sum the complex cross–products over the ROI, then take absolute value.
-                region_product = crossSpec_product(roi_rows, roi_cols, :, :);
-                sum_cross = sum(sum(region_product, 1, 'omitnan'), 2, 'omitnan'); % Sum over spatial dimensions
-                numerator = abs(sum_cross);  % Take the absolute value
-                numerator = squeeze(numerator);  % [nScales x nAngles]
-                
-                % --- New Denominator ---
-                % Sum the absolute values (not squared) of each transform over the ROI.
-                region_B1 = prevWaveletSpec(roi_rows, roi_cols, :, :);
-                region_B2 = spec_full(roi_rows, roi_cols, :, :);
-                sumB1sq = squeeze(sum(sum(abs(region_B1).^2, 1, 'omitnan'), 2, 'omitnan'));  % [nScales x nAngles]
-                sumB2sq = squeeze(sum(sum(abs(region_B2).^2, 1, 'omitnan'), 2, 'omitnan'));  % [nScales x nAngles]
-                gamma_sq = (numerator.^2) ./ (sumB1sq .* sumB2sq);
-                
-                % Compute the phase coherence as the ratio of the new numerator to the new denominator.
-                gamma_val = sqrt(gamma_sq);
-                crossSpec_avg(iy, ix, :, :) = gamma_val;            
-                
-                % For the phase, compute the mean over the ROI.
-                region_phase = phase_diff_temp(roi_rows, roi_cols, :, :);
-                mean_phase = mean(mean(region_phase, 1, 'omitnan'), 2, 'omitnan');  % dimensions: [1, 1, nScales, nAngles]
-                phase_diff_avg(iy, ix, :, :) = squeeze(mean_phase);
-            end
-        end
+        crossSpec_sum = crossSpec_sum + crossSpec_product;
 
-        for iy = 1:num_squares_y
-            for ix = 1:num_squares_x
-                x_start = floor((ix - 1) * adjusted_frame_width / num_squares_x) + 1;
-                x_end = floor(ix * adjusted_frame_width / num_squares_x);
-                y_start = floor((iy - 1) * adjusted_frame_height / num_squares_y) + 1;
-                y_end = floor(iy * adjusted_frame_height / num_squares_y);
+        B1_auto_sum = B1_auto_sum + abs(prevWaveletSpec).^2;
+        B2_auto_sum = B2_auto_sum + abs(spec_full).^2;
 
-            end
-        end
-        
-        if ~exist('maxAllCoherence','var') || isempty(maxAllCoherence)
-            maxAllCoherence = 0;
-        end
-        currentMaxCoherence = max(crossSpec_avg(:));
-        if currentMaxCoherence > maxAllCoherence
-            maxAllCoherence = currentMaxCoherence;
-        end
-
-        if ~exist('maxAllSpeed','var') || isempty(maxAllSpeed)
-            maxAllSpeed = 0;
-        end
-        currentmaxSpeed = max(phase_diff_avg(:));
-        if currentmaxSpeed > maxAllSpeed
-            maxAllSpeed = currentmaxSpeed;
-        end
-
-        % Update the online average for coherence in the current coherence pooling batch.
-        coherencePairCount = coherencePairCount + 1;
-        SpeedPairCount = SpeedPairCount + 1;
-        if coherencePairCount == 1 && SpeedPairCount == 1
-            currentCoherenceBatchAvg = cell(num_squares_y, num_squares_x);
-            currentPhaseDiffBatchAvg = cell(num_squares_y, num_squares_x);
-        end
-
-        for iy = 1:num_squares_y
-            for ix = 1:num_squares_x
-                if coherencePairCount == 1 && SpeedPairCount == 1
-                    currentCoherenceBatchAvg{iy, ix} = crossSpec_avg(iy, ix, :, :);
-                    currentPhaseDiffBatchAvg{iy, ix} = phase_diff_avg(iy, ix, :, :);
-                else
-                    % Extract the current coherence matrix.
-                    currentVal = squeeze(currentCoherenceBatchAvg{iy, ix});
-                    newVal = squeeze(crossSpec_avg(iy, ix, :, :));
-                    % Online update for coherence.
-                    updatedVal = currentVal + (newVal - currentVal) / coherencePairCount;
-                    currentCoherenceBatchAvg{iy, ix} = updatedVal;
-
-                    % Extract the current speed matrix.
-                    currentVal = squeeze(currentPhaseDiffBatchAvg{iy, ix});
-                    newVal = squeeze(phase_diff_avg(iy, ix, :, :));
-                    % Online update for coherence.
-                    updatedVal = currentVal + (newVal - currentVal) / coherencePairCount;
-                    currentPhaseDiffBatchAvg{iy, ix} = updatedVal;
-                end
-            end
-        end
-    end
-    
-    % Update previous frame's transform.
-    prevWaveletSpec = spec_full;
-    
-    % ---- Check if pooling batch is complete for single–frame wave–rose ----
-    if (batchFrameCount == poolSize) || (f_idx == numFrames)
-        batchNumber = batchNumber + 1;
-        % Produce aggregated wave–rose plot for each square using the running average.
-        for iy = 1:num_squares_y
-            for ix = 1:num_squares_x
-                %produceAggregatedWaveRose('Square', currentBatchWaveroseAvg{iy, ix}, Scales, Angles, singleOutDir, sprintf('Square_%d_%d_Batch_%d', iy, ix, batchNumber), saverose,DisplayValuePower);
-            end
-        end
-        % Compute and produce the global aggregated wave–rose (average over all squares).
-        globalWaveRose = zeros(nScales, nAngles);
-        for iy = 1:num_squares_y
-            for ix = 1:num_squares_x
-                globalWaveRose = globalWaveRose + currentBatchWaveroseAvg{iy, ix};
-            end
-        end
-        globalWaveRose = globalWaveRose / (num_squares_y * num_squares_x);
-        produceAggregatedWaveRose('Global', globalWaveRose, Scales, Angles, singleOutDir, sprintf('Global_WaveRose_Batch_%d', batchNumber), saverose,DisplayValuePower);
-        
-        % Display Power Wave–Roses Over Background
-        fig=figure('Units','normalized','Position',[0.1 0.1 0.6 0.6]);
-        
-        % 1) Create a main axes and display the background image.
-        axMain = axes(fig);  % Use fig as parent
-        imagesc(axMain, data_filt);
-        colormap(axMain, 'gray');
-        axis(axMain, 'image');
-        axis(axMain, 'off');
-        title(axMain, 'Background with Power Wave–Roses');
-        
-        % 2) Get the main axes position (in figure-normalized coords) and data limits.
-        posMain = get(axMain, 'Position');  % [x0, y0, w, h] in figure coords (0..1)
-        xLim = axMain.XLim;  % e.g. [1, Nx]
-        yLim = axMain.YLim;  % e.g. [1, Ny]
-        
-        % Facteur pour augmenter la taille des insets
-        sizeFactor = 2;
-        
-        % Décalage pour ajuster l'espacement entre les insets
-        xOffset = 0.035;
-        yOffset = 0.08;
-        
-        % 3) Loop over the squares:
-        for iy = 1:num_squares_y  % Start from the top row
-            for ix = 1:num_squares_x
-        
-                idxS = (iy - 1) * num_squares_x + ix;  % index into the squares array
-                % Pixel coordinates in the data space:
-                xMin = min(squares(idxS).x_range);
-                xMax = max(squares(idxS).x_range);
-                yMin = min(squares(idxS).y_range);
-                yMax = max(squares(idxS).y_range);
-        
-                width  = xMax - xMin + 1;
-                height = yMax - yMin + 1;
-        
-                % 4) Convert these data coords into figure-normalized coordinates.
-                % Horizontal (x):
-                xNorm = posMain(1) + ((xMin - xLim(1)) / (xLim(2) - xLim(1))) * posMain(3);
-                wNorm = (width / (xLim(2) - xLim(1))) * posMain(3) * sizeFactor;
-        
-                % Vertical (y):
-                yNorm = posMain(2) + ((yLim(2) - yMax) / (yLim(2) - yLim(1))) * posMain(4);
-                hNorm = (height / (yLim(2) - yLim(1))) * posMain(4) * sizeFactor;
-        
-                % Ajouter un décalage pour ajuster l'espacement
-                xNorm = xNorm + (ix - 1) * xOffset;
-                yNorm = yNorm - (iy - 1) * yOffset;  % Adjust for top-down
-        
-                % 5) Create an inset axes at [xNorm, yNorm, wNorm, hNorm].
-                axInset = axes('Position', [xNorm+0.07, yNorm-0.08, wNorm, hNorm]);
-        
-                % 6) Plot the coherence wave–rose in that inset axes.
-                waveRose_pow = currentBatchWaveroseAvg{iy, ix};
-             
-                DisplayAggregatedWaveRose('Power Square', waveRose_pow, Scales, Angles, axInset,DisplayValuePower);
-        
-                axis(axInset, 'off');  % Let it "float" on top of the background
-        
-            end
-        end
-        
-        roseFileName = fullfile(singleOutDir, sprintf('Global_PowerWaveRose_Overlay_%d.png', batchNumber));
-        fprintf('Saving wave–rose plot to: %s\n', roseFileName);
-        exportgraphics(fig, roseFileName, 'Resolution', 400);
-        
-        % Reset the batch counter.
-        batchFrameCount = 0;
-    end
-    
-    % ---- Check if pooling batch is complete for coherence (if computed) ----
-    if ~isempty(prevWaveletSpec) && (~isempty(currentCoherenceBatchAvg))
-        if (coherencePairCount == coherencePoolSize) || (f_idx == numFrames)
-            coherenceBatchNumber = coherenceBatchNumber + 1;
-            % Produce aggregated coherence wave–rose plot for each square.
-            for iy = 1:num_squares_y
-                for ix = 1:num_squares_x
-                    %produceAggregatedWaveRose('Coherence_Square', currentCoherenceBatchAvg{iy, ix}, Scales, Angles, singleOutDir, sprintf('Coherence_Square_%d_%d_Batch_%d', iy, ix, coherenceBatchNumber), saverose,DisplayValueCoherence );
-                end
-            end
-            % Compute and produce global coherence (average over all squares).
-            globalCoherence = zeros(nScales, nAngles);
-            for iy = 1:num_squares_y
-                for ix = 1:num_squares_x
-                    globalCoherence = globalCoherence + currentCoherenceBatchAvg{iy, ix};
-                end
-            end
-            globalCoherence = globalCoherence / (num_squares_y * num_squares_x);
-            produceAggregatedWaveRose('Coherence_Global', globalCoherence, Scales, Angles, singleOutDir, sprintf('Global_Coherence_Batch_%d', coherenceBatchNumber), saverose,DisplayValueCoherence );
-            
-            % Display Coherence Wave–Roses Over Background
-            fig = figure('Units','normalized','Position',[0.1 0.1 0.6 0.6]);
-            
-            % 1) Create a main axes and display the background image.
-            axMain = axes();
-            imagesc(axMain, data_filt);
-            colormap(axMain, 'gray');
-            axis(axMain, 'image');
-            axis(axMain, 'off');
-            title(axMain, 'Background with Coherence Wave–Roses');
-            
-            % 2) Get the main axes position (in figure-normalized coords) and data limits.
-            posMain = get(axMain, 'Position');  % [x0, y0, w, h] in figure coords (0..1)
-            xLim = axMain.XLim;  % e.g. [1, Nx]
-            yLim = axMain.YLim;  % e.g. [1, Ny]
-            
-            % Facteur pour augmenter la taille des insets
-            sizeFactor = 2;
-            
-            % Décalage pour ajuster l'espacement entre les insets
-            xOffset = 0.035;
-            yOffset = 0.08;
-            
-            % 3) Loop over the squares:
-            for iy = 1:num_squares_y  % Start from the top row
-                for ix = 1:num_squares_x
-            
-                    idxS = (iy - 1) * num_squares_x + ix;  % index into the squares array
-                    % Pixel coordinates in the data space:
-                    xMin = min(squares(idxS).x_range);
-                    xMax = max(squares(idxS).x_range);
-                    yMin = min(squares(idxS).y_range);
-                    yMax = max(squares(idxS).y_range);
-            
-                    width  = xMax - xMin + 1;
-                    height = yMax - yMin + 1;
-            
-                    % 4) Convert these data coords into figure-normalized coordinates.
-                    % Horizontal (x):
-                    xNorm = posMain(1) + ((xMin - xLim(1)) / (xLim(2) - xLim(1))) * posMain(3);
-                    wNorm = (width / (xLim(2) - xLim(1))) * posMain(3) * sizeFactor;
-            
-                    % Vertical (y):
-                    yNorm = posMain(2) + ((yLim(2) - yMax) / (yLim(2) - yLim(1))) * posMain(4);
-                    hNorm = (height / (yLim(2) - yLim(1))) * posMain(4) * sizeFactor;
-            
-                    % Ajouter un décalage pour ajuster l'espacement
-                    xNorm = xNorm + (ix - 1) * xOffset;
-                    yNorm = yNorm - (iy - 1) * yOffset;  % Adjust for top-down
-            
-                    % 5) Create an inset axes at [xNorm, yNorm, wNorm, hNorm].
-                    axInset = axes('Position', [xNorm+0.07, yNorm-0.08, wNorm, hNorm]);
-            
-                    % 6) Plot the coherence wave–rose in that inset axes.
-                    waveRose_coh = currentCoherenceBatchAvg{iy, ix};
-            
-                    DisplayAggregatedWaveRose('Coherence Square', waveRose_coh, Scales, Angles, axInset, DisplayValueCoherence);
-            
-                    axis(axInset, 'off');  % Let it "float" on top of the background
-            
-                end
-            end
-            
-            roseFileName = fullfile(singleOutDir, sprintf('Global_CoherenceWaveRose_Overlay_%d.png', batchNumber));
-            fprintf('Saving wave–rose plot to: %s\n', roseFileName);
-            exportgraphics(fig, roseFileName, 'Resolution', 400);
-            
-            % Reset the coherence batch counter.
-            coherencePairCount = 0;
-        end
+        % Also accumulate a sum of the phase difference:
+        phase_mat = angle(crossSpec_product);
+        phaseExp_sum = phaseExp_sum + exp(1i * phase_mat);
     end
 
-  % ---- Check if pooling batch is complete for speed (if computed) ----
-    if ~isempty(prevWaveletSpec) && (~isempty(currentPhaseDiffBatchAvg))
-        if (SpeedPairCount == SpeedPoolSize) || (f_idx == numFrames)
-            SpeedBatchNumber = SpeedBatchNumber + 1;
-            % Produce aggregated coherence wave–rose plot for each square.
-            for iy = 1:num_squares_y
-                for ix = 1:num_squares_x
-                    %produceAggregatedWaveRose('Speed_Square', currentPhaseDiffBatchAvg{iy, ix}, Scales, Angles, singleOutDir, sprintf('Speed_Square_%d_%d_Batch_%d', iy, ix, coherenceBatchNumber), saverose,DisplayValueSpeed);
-                end
-            end
-            % Compute and produce global coherence (average over all squares).
-            globalSpeed = zeros(nScales, nAngles);
-            for iy = 1:num_squares_y
-                for ix = 1:num_squares_x
-                    globalSpeed = globalSpeed + currentPhaseDiffBatchAvg{iy, ix};
-                end
-            end
-            globalSpeed = globalSpeed / (num_squares_y * num_squares_x);
-            produceAggregatedWaveRose('Speed_Global', globalSpeed, Scales, Angles, singleOutDir, sprintf('Global_Speed_Batch_%d', coherenceBatchNumber), saverose,DisplayValueSpeed);
-            
-            % Display Speed Wave–Roses Over Background
-            fig=figure('Units','normalized','Position',[0.1 0.1 0.6 0.6]);
-            
-            % 1) Create a main axes and display the background image.
-            axMain = axes(fig);  % Use fig as parent
-            imagesc(axMain, data_filt);
-            colormap(axMain, 'gray');
-            axis(axMain, 'image');
-            axis(axMain, 'off');
-            title(axMain, 'Background with Speed Wave–Roses');
-            
-            % 2) Get the main axes position (in figure-normalized coords) and data limits.
-            posMain = get(axMain, 'Position');  % [x0, y0, w, h] in figure coords (0..1)
-            xLim = axMain.XLim;  % e.g. [1, Nx]
-            yLim = axMain.YLim;  % e.g. [1, Ny]
-            
-            % Facteur pour augmenter la taille des insets
-            sizeFactor = 2;
-            
-            % Décalage pour ajuster l'espacement entre les insets
-            xOffset = 0.035;
-            yOffset = 0.08;
-            
-            % 3) Loop over the squares:
-            for iy = 1:num_squares_y  % Start from the top row
-                for ix = 1:num_squares_x
-            
-                    idxS = (iy - 1) * num_squares_x + ix;  % index into the squares array
-                    % Pixel coordinates in the data space:
-                    xMin = min(squares(idxS).x_range);
-                    xMax = max(squares(idxS).x_range);
-                    yMin = min(squares(idxS).y_range);
-                    yMax = max(squares(idxS).y_range);
-            
-                    width  = xMax - xMin + 1;
-                    height = yMax - yMin + 1;
-            
-                    % 4) Convert these data coords into figure-normalized coordinates.
-                    % Horizontal (x):
-                    xNorm = posMain(1) + ((xMin - xLim(1)) / (xLim(2) - xLim(1))) * posMain(3);
-                    wNorm = (width / (xLim(2) - xLim(1))) * posMain(3) * sizeFactor;
-            
-                    % Vertical (y):
-                    yNorm = posMain(2) + ((yLim(2) - yMax) / (yLim(2) - yLim(1))) * posMain(4);
-                    hNorm = (height / (yLim(2) - yLim(1))) * posMain(4) * sizeFactor;
-            
-                    % Ajouter un décalage pour ajuster l'espacement
-                    xNorm = xNorm + (ix - 1) * xOffset;
-                    yNorm = yNorm - (iy - 1) * yOffset;  % Adjust for top-down
-            
-                    % 5) Create an inset axes at [xNorm, yNorm, wNorm, hNorm].
-                    axInset = axes('Position', [xNorm+0.07, yNorm-0.08, wNorm, hNorm]);
-            
-                    % 6) Plot the speed wave–rose in that inset axes.
-                    waveRose_pow = currentPhaseDiffBatchAvg{iy, ix};
-                 
-                    DisplayAggregatedWaveRose('Speed Square', waveRose_pow, Scales, Angles, axInset,DisplayValueSpeed);
-            
-                    axis(axInset, 'off');  % Let it "float" on top of the background
-            
-                end
-            end
-            
-            roseFileName = fullfile(singleOutDir, sprintf('Global_SpeedWaveRose_Overlay_%d.png', batchNumber));
-            fprintf('Saving wave–rose plot to: %s\n', roseFileName);
-            exportgraphics(fig, roseFileName, 'Resolution', 400);
-            
-            % Reset the coherence batch counter.
-            coherencePairCount = 0;
+    prevWaveletSpec = spec_full;  % Store for next iteration
+
+end  % end for f_idx=1:numFrames
+
+%% 4A) ROI-BASED SUMMARIES
+
+% Build ROI squares.
+
+x_buffer_range = (window_buffer+1):(colsF-window_buffer);
+y_buffer_range = (window_buffer+1):(rowsF-window_buffer);
+adjusted_frame_width = length(x_buffer_range);
+adjusted_frame_height = length(y_buffer_range);
+square_size_px = round(square_size_deg / degrees_per_pixel);
+num_squares_x = ceil(adjusted_frame_width / square_size_px);
+num_squares_y = ceil(adjusted_frame_height / square_size_px);
+squares = [];
+idxS = 1;
+for iy = 1:num_squares_y
+    for ix = 1:num_squares_x
+        x_start = floor((ix - 1) * adjusted_frame_width / num_squares_x) + 1;
+        y_start = floor((iy - 1) * adjusted_frame_height / num_squares_y) + 1;
+        x_end = floor(ix * adjusted_frame_width / num_squares_x);
+        y_end = floor(iy * adjusted_frame_height / num_squares_y);
+        if x_end > x_start && y_end > y_start
+            squares(idxS).x_range = x_buffer_range(x_start:x_end);
+            squares(idxS).y_range = y_buffer_range(y_start:y_end);
+            squares(idxS).index = idxS;
+            idxS = idxS + 1;
         end
     end
 end
+
+numSquares = numel(squares);
+totalFrames = numFrames;          % For single-frame power average
+numPairs    = (numFrames - 1);    % For cross-temporal pairs
+
+% For each ROI, we’ll compute:
+%   - Average single-frame power => (power_sum / totalFrames)
+%   - Coherence => crossSpec_sum / autoSpec_sums
+%   - Phase average => (phaseDiff_sum / numPairs)
+
+numSquares   = numel(squares);
+roiPowerCell = cell(numSquares,1);      % store wave–rose for power
+roiCohCell   = cell(numSquares,1);      % store wave–rose for coherence
+roiSpeedCell = cell(numSquares,1);      % store wave–rose for speed (or phase)
+
+for iROI = 1 : numSquares
+    xR = squares(iROI).x_range;  % e.g. [x_start : x_end]
+    yR = squares(iROI).y_range;  % e.g. [y_start : y_end]
+
+    %--------------------------
+    % (A) Single-frame average power 
+    %--------------------------
+    localPow = power_sum(yR, xR, :, :);       % subarray
+    sumPow   = sum(sum(localPow, 1, 'omitnan'), 2, 'omitnan'); 
+    % sumPow => size [1,1,NSCALES,NANGLES], so squeeze:
+    sumPow   = squeeze(sumPow);  % => [NSCALES, NANGLES]
+    numPixROI = length(yR) * length(xR);
+    avgPower = sumPow / (totalFrames * numPixROI);
+   
+    
+    roiPowerCell{iROI} = avgPower;  % store
+
+    %--------------------------
+    % (B) Cross-temporal coherence 
+    %--------------------------
+    localCross = crossSpec_sum(yR, xR, :, :);
+    localB1    = B1_auto_sum(yR, xR, :, :);
+    localB2    = B2_auto_sum(yR, xR, :, :);
+
+    sumCross = squeeze(sum(sum(localCross, 1, 'omitnan'), 2, 'omitnan'));  % => [NSCALES, NANGLES]
+    sumB1    = squeeze(sum(sum(localB1,  1, 'omitnan'), 2, 'omitnan')); 
+    sumB2    = squeeze(sum(sum(localB2,  1, 'omitnan'), 2, 'omitnan'));
+
+    % Standard formula for coherence^2:
+    % gamma^2 = |SumCross|^2 / ( SumB1 * SumB2 )
+    gamma_sq = ( abs(sumCross).^2 ) ./ ( sumB1 .* sumB2 );
+
+    roiCohCell{iROI} = gamma_sq;
+    %--------------------------
+    % (C) Naive average phase difference => "speed wave–rose" 
+    %--------------------------
+    localPhaseExp = phaseExp_sum(yR, xR, :, :);
+    % Sum over the spatial dimensions (rows and columns):
+    sumPhaseExp = squeeze(sum(sum(localPhaseExp, 1, 'omitnan'), 2, 'omitnan'));
+    numPixROI = length(yR) * length(xR);
+    avgPhase = angle(sumPhaseExp / (numPairs * numPixROI));
+
+    roiSpeedCell{iROI} = avgPhase;
+
+end
+
+%% 4B) Produce Overlaid Figures with Inset Wave–Roses
+
+% 1) Choose a background image. For instance, the last preprocessed frame:
+bgFrameIndex = numFrames;  % last frame
+thisFileName = fNames{bgFrameIndex};
+thisFullPath = fullfile(dataDir, thisFileName);
+data_bg = double(ncread(thisFullPath, varName));
+data_bg_pre = preprocessFrame(data, instrument, methodName, ...
+                thisFullPath, thisTime, ...
+                IR_threshold, IR_fillPercentile, ...
+                VIS_lowerPercentile, VIS_upperPercentile, ...
+                VIS_fillPercentile, clipMinHP, clipMaxHP, ...
+                lowPassFilterWidth_20, lowPassFilterWidth_50, lowPassFilterWidth_100, ...
+                Insolation_Correction);  % do same steps as you do in the loop
+
+if doWindow
+    switch lower(windowType)
+        case 'radial'
+            data_bg_pre = applyRadialWindow(data_bg_pre, radius_factor, decay_rate);
+        case 'rectangular'
+            data_bg_pre = applyRectangularWindow(data_bg_pre, radius_factor, decay_rate);
+    end
+end
+
+produceOverlayWaveRose('Power', roiPowerCell, squares, num_squares_x, num_squares_y, ...
+                        Scales, Angles, DisplayValuePower, data_bg_pre, singleOutDir, 'Global_PowerWaveRose_Overlay.png');
+
+produceOverlayWaveRose('Coherence', roiCohCell, squares, num_squares_x, num_squares_y, ...
+                        Scales, Angles, DisplayValueCoherence, data_bg_pre, singleOutDir, 'Global_CoherenceWaveRose_Overlay.png');
+
+produceOverlayWaveRose('Phase', roiSpeedCell, squares, num_squares_x, num_squares_y, ...
+                        Scales, Angles, DisplayValuePhase, data_bg_pre, singleOutDir, 'Global_PhaseWaveRose_Overlay.png');
+
+produceOverlayWaveRose('Speed', roiSpeedCell, squares, num_squares_x, num_squares_y, ...
+                        Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global_SpeedWaveRose_Overlay.png');
+
+
+%% 5) GLOBAL AVERAGE WAVE ROSES
+% Aafter Section 3, we have the following accumulators:
+%   power_sum     : sum over frames of |spec_full|^2, size [rowsF, colsF, NSCALES, NANGLES]
+%   crossSpec_sum : sum over consecutive-frame pairs of (B1 .* conj(B2))
+%   B1_auto_sum   : sum over pairs of |B1|^2 (previous frame)
+%   B2_auto_sum   : sum over pairs of |B2|^2 (current frame)
+%   phaseExp_sum  : sum over pairs of exp(1i*phase_diff), for circular averaging
+
+% Define total numbers:
+totalFrames = numFrames;         % for single-frame (power) sums
+numPairs    = numFrames - 1;      % for cross-temporal quantities
+numPixels   = rowsF * colsF;       % total pixels per frame
+
+% ----- (A) Global Power Wave–Rose -----
+% Average power over frames and spatial domain:
+globalPower = squeeze( sum(sum(power_sum, 1, 'omitnan'), 2, 'omitnan') ) ...
+              / (totalFrames * numPixels);
+% Produce the global wave–rose plot:
+produceAggregatedWaveRose('Power_Global', globalPower, Scales, Angles, ...
+    singleOutDir, 'Global_PowerWaveRose', saverose, DisplayValuePower);
+
+% ----- (B) Global Coherence Wave–Rose -----
+globalCross = squeeze( sum(sum(crossSpec_sum, 1, 'omitnan'), 2, 'omitnan') );
+globalB1    = squeeze( sum(sum(B1_auto_sum,   1, 'omitnan'), 2, 'omitnan') );
+globalB2    = squeeze( sum(sum(B2_auto_sum,   1, 'omitnan'), 2, 'omitnan') );
+% Compute coherence (using standard formula: |S12|^2 / (S11*S22)):
+globalCoherence = ( abs(globalCross).^2 ) ./ (globalB1 .* globalB2 );
+produceAggregatedWaveRose('Coherence_Global', globalCoherence, Scales, Angles, ...
+    singleOutDir, 'Global_CoherenceWaveRose', saverose, DisplayValueCoherence);
+
+% ----- (C) Global Speed (Phase) Wave–Rose -----
+% For phase differences, we average the complex exponentials (for circular averaging)
+globalPhaseExp = squeeze( sum(sum(phaseExp_sum, 1, 'omitnan'), 2, 'omitnan') );
+% Average over the number of pairs and spatial domain:
+globalAvgPhase = angle( globalPhaseExp / (numPairs * numPixels) );
+produceAggregatedWaveRose('Speed_Global', globalAvgPhase, Scales, Angles, ...
+    singleOutDir, 'Global_SpeedWaveRose', saverose, DisplayValueSpeed);
+
+% ----- (D) Global Phase Wave–Rose -----
+% For phase differences, we average the complex exponentials (for circular averaging)
+produceAggregatedWaveRose('Phase_Global', globalAvgPhase, Scales, Angles, ...
+    singleOutDir, 'Global_PhaseWaveRose', saverose, DisplayValuePhase);
+
 
 fprintf('\nAll done. Single–frame and cross–temporal wavelet (coherence) computations complete.\n');
 
 
 %% HELPER FUNCTIONS
 %==========================================================================
+function produceOverlayWaveRose(metricLabel, roiCell, squares, num_squares_x, num_squares_y, ...
+                                Scales, Angles, DisplayValue, data_bg_pre, outDir, fileName)
+% produceOverlayWaveRose produces a figure with insets of wave–rose plots
+% overlaid on a background image.
+%
+% Inputs:
+%   metricLabel   - A string indicating the metric (e.g. 'Power', 'Coherence', 'Speed').
+%   roiCell       - A cell array containing the [nScales x nAngles] wave–rose matrix for each ROI.
+%   squares       - A structure array defining each ROI with fields 'x_range' and 'y_range'.
+%   num_squares_x - Number of ROI squares in the horizontal direction.
+%   num_squares_y - Number of ROI squares in the vertical direction.
+%   Scales, Angles- Vectors defining your wavelet scales and angles.
+%   DisplayValue  - A scalar (or two-element vector for speed) to set the color axis.
+%   data_bg_pre   - The background image (preprocessed) to display.
+%   outDir        - Output directory where the figure will be saved.
+%   fileName      - Name of the output file (e.g. 'Global_PowerWaveRose_Overlay.png').
+%
+% Example:
+%   produceOverlayWaveRose('Power', roiPowerCell, squares, numSquares_x, numSquares_y, ...
+%                           Scales, Angles, DisplayValuePower, data_bg_pre, outDir, 'Global_PowerOverlay.png');
+
+    % Create the figure with the background image.
+    fig = figure('Units','normalized','Position',[0.1 0.1 0.6 0.6]);
+    axMain = axes(fig);
+    imagesc(axMain, data_bg_pre);
+    colormap(axMain, 'gray');
+    axis(axMain, 'image');
+    axis(axMain, 'off');
+    title(axMain, ['Background with ' metricLabel ' Wave–Roses']);
+    
+    % Get main axes position and data limits.
+    posMain = get(axMain, 'Position');   % [x0, y0, w, h] in figure normalized coordinates.
+    xLim    = axMain.XLim;              % e.g. [1, Nx]
+    yLim    = axMain.YLim;              % e.g. [1, Ny]
+    
+    % Set inset scaling and offsets.
+    sizeFactor = 2;    % Factor to enlarge each inset.
+    xOffset   = 0.035; % Horizontal offset between insets.
+    yOffset   = 0.08;  % Vertical offset between insets.
+    
+    % Loop over all ROIs.
+    for iy = 1:num_squares_y
+        for ix = 1:num_squares_x
+            idxS = (iy - 1) * num_squares_x + ix;  % index into squares array.
+            roi = squares(idxS);
+            
+            % Get pixel coordinate bounds for the ROI.
+            xMin = min(roi.x_range);
+            xMax = max(roi.x_range);
+            yMin = min(roi.y_range);
+            yMax = max(roi.y_range);
+            width  = xMax - xMin + 1;
+            height = yMax - yMin + 1;
+            
+            % Convert ROI data coordinates to figure–normalized coordinates.
+            xNorm = posMain(1) + ((xMin - xLim(1)) / (xLim(2) - xLim(1))) * posMain(3);
+            wNorm = (width / (xLim(2) - xLim(1))) * posMain(3) * sizeFactor;
+            yNorm = posMain(2) + ((yLim(2) - yMax) / (yLim(2) - yLim(1))) * posMain(4);
+            hNorm = (height / (yLim(2) - yLim(1))) * posMain(4) * sizeFactor;
+            
+            % Adjust for spacing between insets.
+            xNorm = xNorm + (ix - 1) * xOffset;
+            yNorm = yNorm - (iy - 1) * yOffset;
+            
+            % Create an inset axes at the computed position.
+            axInset = axes('Position', [xNorm+0.07, yNorm-0.08, wNorm, hNorm]);
+            
+            % Retrieve the corresponding wave–rose matrix.
+            roiMatrix = roiCell{idxS};
+            
+            % Plot the wave–rose for this ROI. (DisplayAggregatedWaveRose is your helper.)
+            DisplayAggregatedWaveRose([metricLabel ' Square'], roiMatrix, Scales, Angles, axInset, DisplayValue);
+            
+            axis(axInset, 'off');
+        end
+    end
+    
+    % Save the overlay figure.
+    overlayFileName = fullfile(outDir, fileName);
+    exportgraphics(fig, overlayFileName, 'Resolution', 400);
+    fprintf('Saved %s wave–rose overlay to: %s\n', metricLabel, overlayFileName);
+end
 
 function DisplayAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, axHandle, maxVal)
 % DISPLAYAGGREGATEDWAVEROSE Displays an aggregated wave-rose plot in a provided axes.
@@ -801,7 +617,7 @@ function DisplayAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, axHand
         error('An axes handle (axHandle) must be provided.');
     end
     
-    if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
+    if startsWith(labelStr, 'Speed', 'IgnoreCase', true) || startsWith(labelStr, 'Phase', 'IgnoreCase', true)
         minVal = maxVal(1);
         maxVal = maxVal(2);
     end
@@ -831,11 +647,12 @@ function DisplayAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, axHand
     % Interpolate the innerpower onto the fine grid.
     F = griddedInterpolant(Theta_orig', R_orig', innerpower', 'spline');
     innerpower_fine = F(Theta_fine', R_fine')';
-
+  
     if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
+        pixel_size_km = evalin('base','pixel_size_km');
         % For each row (corresponding to a fine-scale value), multiply by that scale.
         for iRow = 1:size(innerpower_fine,1)
-            innerpower_fine(iRow, :) = (8900*(innerpower_fine(iRow, :)/(2*pi)) .* Scales_fine_linear(iRow)* pi/sqrt(2))/ 1800;
+            innerpower_fine(iRow, :) = (pixel_size_km*1000*(innerpower_fine(iRow, :)/(2*pi)) .* Scales_fine_linear(iRow)* pi/sqrt(2))/ 1800;
         end
     end
     
@@ -852,16 +669,18 @@ function DisplayAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, axHand
         colormap(axHandle, 'jet');
     elseif startsWith(labelStr, 'Coherence', 'IgnoreCase', true)
         colormap(axHandle, 'turbo');
-    else
+    elseif startsWith(labelStr, 'Power', 'IgnoreCase', true)
         colormap(axHandle, 'parula');
+    elseif startsWith(labelStr, 'Phase', 'IgnoreCase', true)
+        colormap(axHandle, 'hsv');
     end
     axis(axHandle, 'equal', 'tight', 'off');
     
     % Optionally set color axis limits if maxVal is provided.
-    if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
-            caxis(axHandle, [minVal, maxVal]);
+    if startsWith(labelStr, 'Speed', 'IgnoreCase', true) || startsWith(labelStr, 'Phase', 'IgnoreCase', true)
+            clim(axHandle, [minVal, maxVal]);
     elseif nargin >= 6 && ~isempty(maxVal)
-            caxis(axHandle, [0, maxVal]);
+            clim(axHandle, [0, maxVal]);
     end
     
     % Optionally add radial grid lines.
@@ -921,9 +740,10 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
 
     % --- Modification for Speed: multiply each row by its corresponding scale ---
     if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
+        pixel_size_km = evalin('base','pixel_size_km');
         % For each row (corresponding to a fine-scale value), multiply by that scale.
         for iRow = 1:size(innerpower_fine,1)
-            innerpower_fine(iRow, :) = (8900*(innerpower_fine(iRow, :)/(2*pi)) .* Scales_fine_linear(iRow)* pi/sqrt(2))/ 1800;
+            innerpower_fine(iRow, :) = (pixel_size_km*1000*(innerpower_fine(iRow, :)/(2*pi)) .* Scales_fine_linear(iRow)* pi/sqrt(2))/ 1800;
         end
     end
     
@@ -942,10 +762,13 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
         colormap(ax1, 'turbo');
     elseif startsWith(labelStr, 'Speed', 'IgnoreCase', true)
         colormap(ax1,'jet')
-    else
+    elseif startsWith(labelStr, 'Power', 'IgnoreCase', true)
         colormap(ax1, 'parula');
+    elseif startsWith(labelStr, 'Phase', 'IgnoreCase', true)
+        colormap(ax1, 'hsv');
     end
-    if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
+
+    if startsWith(labelStr, 'Speed', 'IgnoreCase', true)|| startsWith(labelStr, 'Phase', 'IgnoreCase', true)
         clim(ax1, [minVal, maxVal]);
     elseif ~isempty(maxVal)  
         clim(ax1, [0, maxVal]);
@@ -1314,18 +1137,13 @@ function img_processed = processDataMethod(data, methodName, clipMinHP, clipMaxH
     switch lower(methodName)
         case 'none'
             img_processed = data';
-        case 'raw_normalized'
-            img_processed = normalizeData(data);
-            img_processed = 1 - img_processed;
-            img_processed = img_processed';
         case 'truncated'
             lower_bound = 280;
             upper_bound = 292.5;
             img_p = data;
             img_p(img_p < lower_bound) = lower_bound;
             img_p(img_p > upper_bound) = upper_bound;
-            img_p = (img_p - lower_bound) / (upper_bound - lower_bound);
-            img_p = 1 - img_p;
+            img_p = standardizeData(img_p);
             img_processed = img_p';
         case 'highpass_20'
             img_p = applyHighPass(data, lpWidth20, false, clipMinHP, clipMaxHP);
@@ -1348,12 +1166,10 @@ function img_processed = processDataMethod(data, methodName, clipMinHP, clipMaxH
         case 'raw_masked'
             maskLimit = 295;
             data(data > maskLimit) = NaN;
-            img_p = normalizeDataNaN(data);
-            img_p = 1 - img_p;
+            img_p = standardizeDataNaN(data);
             img_processed = img_p';
         case 'raw'
-            img_p = normalizeDataNaN(data);
-            img_p = 1 - img_p;
+            img_p = standardizeDataNaN(data);
             img_processed = img_p';
         otherwise
             error('Unknown method: %s', methodName);
@@ -1369,8 +1185,7 @@ function img_out = applyHighPass(data, filterWidth, doSqrtEnhance, clipMinHP, cl
     end
     highPass(highPass < clipMinHP) = clipMinHP;
     highPass(highPass > clipMaxHP) = clipMaxHP;
-    img_out = (highPass - clipMinHP) / (clipMaxHP - clipMinHP);
-    img_out = 1 - img_out;
+    img_out = standardizeData(highPass);
 end
 %--------------------------------------------------------------------------
 
@@ -1422,6 +1237,20 @@ function data_win = applyRectangularWindow(data_in, radius_factor, decay_rate)
     
     % Blend data_in with the median (instead of fading to zero):
     data_win = window .* data_in + (1 - window) .* median_val;
+end
+%--------------------------------------------------------------------------
+
+function out = standardizeData(data)
+    meanVal = mean(data(:), 'omitnan');
+    stdVal  = std(data(:),  'omitnan');
+    out    = (data - meanVal) ./ stdVal;
+end
+%--------------------------------------------------------------------------
+
+function out = standardizeDataNaN(data)
+    nanMask = isnan(data);
+    data(nanMask) = min(data(~nanMask));
+    out = standardizeData(data);
 end
 %--------------------------------------------------------------------------
 
@@ -1595,13 +1424,14 @@ function produceAnnotatedImages(dataType, spec_full, data_background, squares, .
         fig = figure('visible','off');
         switch upper(dataType)
             case 'IR'
-                imagesc(data_background, [0 1])
+                imagesc(data_background, [-2 2])
+                colormap(flipud(gray))
             case 'VIS'
                 image(data_background);
+                colormap(gray)
             otherwise
                 error('Unknown dataType.');
         end
-        colormap(gray);
         axis image off;
         hold on;
     
@@ -1709,20 +1539,6 @@ function roundedDT = roundToQuarterHour(originalDT)
     else
         roundedDT = dateshift(originalDT, 'start', 'minute') + minutes(15 - minutesFromQuarter);
     end
-end
-%--------------------------------------------------------------------------
-
-function out = normalizeData(data)
-    mn = min(data(:));
-    mx = max(data(:));
-    out = (data - mn) / (mx - mn);
-end
-%--------------------------------------------------------------------------
-
-function out = normalizeDataNaN(data)
-    nanMask = isnan(data);
-    data(nanMask) = min(data(~nanMask));
-    out = normalizeData(data);
 end
 %--------------------------------------------------------------------------
 
