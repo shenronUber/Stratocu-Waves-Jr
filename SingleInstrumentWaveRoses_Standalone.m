@@ -39,7 +39,7 @@ alpha = 0.5;           % The variable alpha is an overall radial decay factor th
 %----------- WINDOWING SETTINGS -----------------------------
 doWindow = true;              % Flag to apply windowing
 windowType = 'rectangular';   % 'radial' or 'rectangular'
-radius_factor = 0.8;          % Parameter for window function (if used)
+radius_factor = 0.6;          % Parameter for window function (if used)
 decay_rate = 10;              % Controls steepness of window edge
 
 %----------- SQUARE-PARTITIONING PARAMETERS ----------------
@@ -73,19 +73,12 @@ switch upper(instrument)
         error('Unknown instrument: %s', instrument);
 end
 
-%----------- WAVE-ROSE & PEAK DETECTION ---------------------
-nAngles_fineFactor  = 4;            % Factor to refine angular resolution in the rose plot
-nScales_fineFactor  = 4;            % Factor to refine scale resolution in the rose plot
-peakDetectionFactor = 1;            % Threshold factor (mean + factor*std) for peak detection
-contourArray        = [95 97 99];    % [Used as either percentiles or absolute values for contouring]
-ArrayMode           = 'percentile'; % 'percentile' or 'absolute'
-
 %----------- IMAGE ANNOTATIONS & OUTPUT ---------------------
 saverose = true;            % Flag to save the wave–rose image
 DisplayValuePower = 4*10^-3.5;
 DisplayValueCoherence = 1;
 DisplayValuePhase = [-pi/2;pi/2];
-DisplayValueSpeed = [-30;30];
+DisplayValueSpeed = [-15;15];
 
 %----------- SYNTHETIC DATA SETTINGS ----------------------
 syntheticWaveMode = true;   % If true, superimpose a synthetic wave on a fixed base image
@@ -275,7 +268,7 @@ for f_idx = 1:numFrames
         % circshift( data, [row_shift, column_shift] )
         data = circshift(data, [shift_dy, shift_dx]);
     end
-%%
+
     % ---- Preprocessing (thresholds, highpass, etc.) ----
     data_pre = preprocessFrame(data, instrument, methodName, ...
                 thisFullPath, thisTime, ...
@@ -284,7 +277,7 @@ for f_idx = 1:numFrames
                 VIS_fillPercentile, clipMinHP, clipMaxHP, ...
                 lowPassFilterWidth_20, lowPassFilterWidth_50, lowPassFilterWidth_100, ...
                 Insolation_Correction);
-%%
+
     % ---- Resize or window if needed ----
     if shrinkfactor ~= 1
         data_pre = imresize(data_pre, invshrinkfactor);
@@ -470,17 +463,16 @@ if doWindow
 end
 
 produceOverlayWaveRose('Power', roiPowerCell, squares, num_squares_x, num_squares_y, ...
-                        Scales, Angles, DisplayValuePower, data_bg_pre, singleOutDir, 'Global_PowerWaveRose_Overlay.png');
+                        Scales, Angles, DisplayValuePower, data_bg_pre, singleOutDir, 'Global PowerWaveRose Overlay.png');
 
 produceOverlayWaveRose('Coherence', roiCohCell, squares, num_squares_x, num_squares_y, ...
-                        Scales, Angles, DisplayValueCoherence, data_bg_pre, singleOutDir, 'Global_CoherenceWaveRose_Overlay.png');
+                        Scales, Angles, DisplayValueCoherence, data_bg_pre, singleOutDir, 'Global CoherenceWaveRose Overlay.png');
 
 produceOverlayWaveRose('Phase', roiSpeedCell, squares, num_squares_x, num_squares_y, ...
-                        Scales, Angles, DisplayValuePhase, data_bg_pre, singleOutDir, 'Global_PhaseWaveRose_Overlay.png');
+                        Scales, Angles, DisplayValuePhase, data_bg_pre, singleOutDir, 'Global PhaseWaveRose Overlay.png');
 
 produceOverlayWaveRose('Speed', roiSpeedCell, squares, num_squares_x, num_squares_y, ...
-                        Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global_SpeedWaveRose_Overlay.png');
-
+                        Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global SpeedWaveRose Overlay.png');
 
 %% 5) GLOBAL AVERAGE WAVE ROSES
 % After Section 3, we have the following accumulators:
@@ -500,8 +492,8 @@ numPixels   = rowsF * colsF;       % total pixels per frame
 globalPower = squeeze( sum(sum(power_sum, 1, 'omitnan'), 2, 'omitnan') ) ...
               / (totalFrames * numPixels);
 % Produce the global wave–rose plot:
-produceAggregatedWaveRose('Power_Global', globalPower, Scales, Angles, ...
-    singleOutDir, 'Global_PowerWaveRose', saverose, DisplayValuePower);
+produceAggregatedWaveRose('Power Global', globalPower, Scales, Angles, ...
+    singleOutDir, 'Global PowerWaveRose', saverose, DisplayValuePower);
 
 % ----- (B) Global Coherence Wave–Rose -----
 globalCross = squeeze( sum(sum(crossSpec_sum, 1, 'omitnan'), 2, 'omitnan') );
@@ -509,21 +501,21 @@ globalB1    = squeeze( sum(sum(B1_auto_sum,   1, 'omitnan'), 2, 'omitnan') );
 globalB2    = squeeze( sum(sum(B2_auto_sum,   1, 'omitnan'), 2, 'omitnan') );
 % Compute coherence (using standard formula: |S12|^2 / (S11*S22)):
 globalCoherence = ( abs(globalCross).^2 ) ./ (globalB1 .* globalB2 );
-produceAggregatedWaveRose('Coherence_Global', globalCoherence, Scales, Angles, ...
-    singleOutDir, 'Global_CoherenceWaveRose', saverose, DisplayValueCoherence);
+produceAggregatedWaveRose('Coherence Global', globalCoherence, Scales, Angles, ...
+    singleOutDir, 'Global CoherenceWaveRose', saverose, DisplayValueCoherence);
 
 % ----- (C) Global Speed (Phase) Wave–Rose -----
 % For phase differences, we average the complex exponentials (for circular averaging)
 globalPhaseExp = squeeze( sum(sum(phaseExp_sum, 1, 'omitnan'), 2, 'omitnan') );
 % Average over the number of pairs and spatial domain:
 globalAvgPhase = angle( globalPhaseExp / (numPairs * numPixels) );
-produceAggregatedWaveRose('Speed_Global', globalAvgPhase, Scales, Angles, ...
-    singleOutDir, 'Global_SpeedWaveRose', saverose, DisplayValueSpeed);
+produceAggregatedWaveRose('Speed Global', globalAvgPhase, Scales, Angles, ...
+    singleOutDir, 'Global SpeedWaveRose', saverose, DisplayValueSpeed);
 
 % ----- (D) Global Phase Wave–Rose -----
 % For phase differences, we average the complex exponentials (for circular averaging)
-produceAggregatedWaveRose('Phase_Global', globalAvgPhase, Scales, Angles, ...
-    singleOutDir, 'Global_PhaseWaveRose', saverose, DisplayValuePhase);
+produceAggregatedWaveRose('Phase Global', globalAvgPhase, Scales, Angles, ...
+    singleOutDir, 'Global PhaseWaveRose', saverose, DisplayValuePhase);
 
 
 fprintf('\nAll done. Single–frame and cross–temporal wavelet (coherence) computations complete.\n');
@@ -654,36 +646,36 @@ function DisplayAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, axHand
     % Use the provided matrix as the "innerpower" for display.
     innerpower = waveRoseMat;
     
-    % Refine grid for smoother plotting.
-    nAngles_fineFactor = 4;
-    nScales_fineFactor = 4;
-    Angles_fine = linspace(min(Angles), max(Angles), nAngles_fineFactor * nAngles);
-    Scales_fine_linear = linspace(min(Scales), max(Scales), nScales_fineFactor * nScales);
+    % --- Compute edges for angles and log scales ---
+    % Angular edges (midpoints between given angles)
+    d_angle = diff(Angles(1:2)); % Assumes uniform spacing
+    angle_edges = [Angles - d_angle/2, Angles(end) + d_angle/2];
+    %angle_edges = Angles - d_angle/2;
+
+    % Log-scale edges (midpoints between log10(Scales))
+    log_Scales = log10(Scales);
+    d_log = diff(log_Scales(1:2)); % Assumes uniform log spacing
+    log_edges = [log_Scales(1) - d_log/2, log_Scales + d_log/2];
     
-    [Theta_orig, R_orig] = meshgrid(Angles, Scales);
-    [Theta_fine, R_fine] = meshgrid(Angles_fine, Scales_fine_linear);
-    R_orig_log = log10(R_orig);
-    R_fine_log = log10(R_fine);
-    
-    % Interpolate the innerpower onto the fine grid.
-    F = griddedInterpolant(Theta_orig', R_orig', innerpower', 'spline');
-    innerpower_fine = F(Theta_fine', R_fine')';
-  
+    % Create meshgrid of edges
+    [Theta_edges, R_edges] = meshgrid(angle_edges, log_edges);
+
+   
     if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
         pixel_size_km = evalin('base','pixel_size_km');
         % For each row (corresponding to a fine-scale value), multiply by that scale.
-        for iRow = 1:size(innerpower_fine,1)
-            innerpower_fine(iRow, :) = (pixel_size_km*1000*(innerpower_fine(iRow, :)/(2*pi)) .* Scales_fine_linear(iRow)* pi/sqrt(2))/ 1800;
+        for iRow = 1:size(innerpower,1)
+             innerpower(iRow, :) = (pixel_size_km*1000*(innerpower(iRow, :)/(2*pi)) .* Scales(iRow)* pi/sqrt(2))/1800;
         end
     end
     
     % Convert polar coordinates to Cartesian (using a log-scale for R).
-    [X_pos_fine, Y_pos_fine] = pol2cart(Theta_fine, R_fine_log);
-    [X_neg_fine, Y_neg_fine] = pol2cart(Theta_fine + pi, R_fine_log);
-    
+    [X_pos, Y_pos] = pol2cart(Theta_edges, R_edges);
+    padded_power = padarray(innerpower, [1 1], NaN, 'post'); % Add NaNs to edges
+   
     % Plot the positive half of the rose.
-    pcolor(axHandle, X_pos_fine, Y_pos_fine, innerpower_fine);
-    shading(axHandle, 'interp');
+    pcolor(axHandle,X_pos, Y_pos, padded_power);
+    shading(axHandle, 'flat');
     
     % Choose colormap based on label.
     if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
@@ -711,8 +703,8 @@ function DisplayAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, axHand
         theta_ring = linspace(0, 2*pi, 180);
         [x_ring, y_ring] = pol2cart(theta_ring, level_log);
         plot(axHandle, x_ring, y_ring, 'k--', 'LineWidth',0.5);
-        %text(axHandle, level_log, 0, sprintf('%.1f', Scales(i)), ...
-        %     'Color','k','FontSize',4,'HorizontalAlignment','left');
+                val_linear = 10^(level_log);
+        %text(axHandle, level_log, 0, sprintf('%.2f', val_linear), 'Color','k','FontSize',5,'HorizontalAlignment','left');
     end
 
     
@@ -730,7 +722,7 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
         saverose = true;
     end
     if nargin < 8
-        maxVal = [];  % if not provided, use auto-scale
+        maxVal = [];  % Auto-scale if not provided
     end
 
     if size(maxVal,1)==2
@@ -738,49 +730,45 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
         maxVal = maxVal(2);
     end
 
-    % Dimensions
-    nScales = length(Scales);
-    nAngles = length(Angles);
-    
-    % Use waveRoseMat as the "innerpower" (power spectrum display)
     innerpower = waveRoseMat;
-    
-    % Refine grid for smoother plotting.
-    nAngles_fineFactor  = 4;
-    nScales_fineFactor  = 4;
-    Angles_fine = linspace(min(Angles), max(Angles), nAngles_fineFactor * nAngles);
-    Scales_fine_linear = linspace(min(Scales), max(Scales), nScales_fineFactor * nScales);
-    [Theta_orig, R_orig] = meshgrid(Angles, Scales);
-    [Theta_fine, R_fine] = meshgrid(Angles_fine, Scales_fine_linear);
-    R_orig_log = log10(R_orig);
-    R_fine_log = log10(R_fine);
-    
-    % Interpolate the innerpower onto the fine grid.
-    F = griddedInterpolant(Theta_orig', R_orig', innerpower', 'spline');
-    innerpower_fine = F(Theta_fine', R_fine')';
 
-    % --- Modification for Speed: multiply each row by its corresponding scale ---
+    % --- Compute edges for angles and log scales ---
+    % Angular edges (midpoints between given angles)
+    d_angle = diff(Angles(1:2)); % Assumes uniform spacing
+    angle_edges = [Angles - d_angle/2, Angles(end) + d_angle/2];
+    %angle_edges = Angles - d_angle/2;
+
+    % Log-scale edges (midpoints between log10(Scales))
+    log_Scales = log10(Scales);
+    d_log = diff(log_Scales(1:2)); % Assumes uniform log spacing
+    log_edges = [log_Scales(1) - d_log/2, log_Scales + d_log/2];
+    
+    % Create meshgrid of edges
+    [Theta_edges, R_edges] = meshgrid(angle_edges, log_edges);
+
+    % --- Modification for Speed ---
     if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
         pixel_size_km = evalin('base','pixel_size_km');
-        % For each row (corresponding to a fine-scale value), multiply by that scale.
-        for iRow = 1:size(innerpower_fine,1)
-            innerpower_fine(iRow, :) = (pixel_size_km*1000*(innerpower_fine(iRow, :)/(2*pi)) .* Scales_fine_linear(iRow)* pi/sqrt(2))/ 1800;
+        for iRow = 1:size(innerpower,1)
+            innerpower(iRow, :) = (pixel_size_km*1000*(innerpower(iRow, :)/(2*pi)) .* Scales(iRow)* pi/sqrt(2))/1800;
         end
     end
+
+    % Convert to Cartesian coordinates
+    [X_pos, Y_pos] = pol2cart(Theta_edges, R_edges);
     
-    % Convert to Cartesian coordinates for plotting.
-    [X_pos_fine, Y_pos_fine] = pol2cart(Theta_fine, R_fine_log);
-    [X_neg_fine, Y_neg_fine] = pol2cart(Theta_fine + pi, R_fine_log);
-    
-    % Create figure.
-    figRose = figure('visible','off');
+    padded_power = padarray(innerpower, [1 1], NaN, 'post'); % Add NaNs to edges
+   
+    % Create figure and plot
+    figRose = figure('visible','on');
     set(figRose, 'Position', [100 100 600 600]);
     ax1 = axes('Position',[0.1 0.1 0.75 0.75]);
     hold(ax1, 'on');
-    pcolor(ax1, X_pos_fine, Y_pos_fine, innerpower_fine);
-    shading(ax1, 'interp');
+    pcolor(ax1, X_pos, Y_pos, padded_power);
+    shading(ax1, 'flat');
+    
     if startsWith(labelStr, 'Coherence', 'IgnoreCase', true)
-        colormap(ax1, 'turbo');
+            colormap(ax1, 'turbo');
     elseif startsWith(labelStr, 'Speed', 'IgnoreCase', true)
         colormap(ax1,'jet')
     elseif startsWith(labelStr, 'Power', 'IgnoreCase', true)
@@ -794,44 +782,52 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
     elseif ~isempty(maxVal)  
         clim(ax1, [0, maxVal]);
     else
-        clim(ax1, [0, max(innerpower_fine(:))]);
+        clim(ax1, [0, max(innerpower(:))]);
     end
+
+    % Set hard axis limits to contain upper half
+    xlim(ax1, [min(X_pos,[],'all')*1.1  max(X_pos,[],'all')*1.1 ]);
+    ylim(ax1, [min(Y_pos,[],'all')*1.1 max(Y_pos,[],'all')*1.05]);  % Restrict to upper half
+
     axis(ax1, 'equal', 'tight', 'off');
-    
-    % Duplicate plot for negative angles.
-    ax2 = axes('Position', ax1.Position, 'Color','none', 'HitTest','off');
-    hold(ax2, 'on');
-    pcolor(ax2, X_neg_fine, Y_neg_fine, innerpower_fine);
-    shading(ax2, 'interp');
-    if ~isempty(maxVal)
-        clim(ax2, [0, maxVal]);
-    else
-        clim(ax2, [0, max(innerpower_fine(:))]);
-    end
-    axis(ax2, 'equal', 'tight', 'off');
-    
-    uistack(ax1, 'top');
-    linkprop([ax1 ax2], {'XLim','YLim','Position','CameraPosition','CameraUpVector'});
+
+    % Drawing outlines
+    theta_outline = linspace(0-(d_angle/2), pi+(d_angle/2), 100);  
+    [x_outline, y_outline] = pol2cart(theta_outline, max(X_pos,[],'all'));
+    plot(ax1, x_outline, y_outline, 'k-', 'LineWidth', 1.5);
+
+    inner_radius = log_edges(1);
+    theta_outline_inner = linspace(0 - d_angle/2, pi + d_angle/2, 100);
+    [x_inner, y_inner] = pol2cart(theta_outline_inner, inner_radius);
+    plot(ax1, x_inner, y_inner, 'k-', 'LineWidth', 1.5);
+
+    [x_debut, y_debut] = pol2cart(pi + d_angle/2, inner_radius);
+    [x_fin, y_fin] = pol2cart(pi + d_angle/2, log_edges(end));
+
+    plot(ax1, [x_debut, x_fin], [y_debut, y_fin], 'k-', 'LineWidth', 1.5);
+
+    [x_debut, y_debut] = pol2cart(0 - d_angle/2, inner_radius);
+    [x_fin, y_fin] = pol2cart(0 - d_angle/2, log_edges(end));
+
+    plot(ax1, [x_debut, x_fin], [y_debut, y_fin], 'k-', 'LineWidth', 1.5);
     
     % Add radial grid lines (using logarithmic scale for the scales).
     max_scale_log = log10(max(Scales));
     for i = 1:length(Scales)
         level_log = log10(Scales(i));
-        theta_ring = linspace(0, 2*pi, 180);
+        theta_ring = linspace(0-(d_angle/2), pi+(d_angle/2), 180);
         [x_ring, y_ring] = pol2cart(theta_ring, level_log);
         plot(ax1, x_ring, y_ring, 'k--', 'LineWidth',0.5);
-        plot(ax2, x_ring, y_ring, 'k--', 'LineWidth',0.5);
-        val_linear = 10^(level_log);
-        text(ax1, level_log, 0, sprintf('%.2f', val_linear), 'Color','k','FontSize',4,'HorizontalAlignment','left');
+                val_linear = 10^(level_log);
+        text(ax1, level_log, 0, sprintf('%.2f', val_linear), 'Color','k','FontSize',5,'HorizontalAlignment','left');
     end
     
     % Add angular lines.
-    angle_ticks = linspace(0, 2*pi, 7);
-    max_r = max_scale_log * 1.1;
+    angle_ticks = linspace(0, pi, 7);
+    max_r = max(X_pos,[],'all');
     for i = 1:length(angle_ticks)
         [x_label, y_label] = pol2cart(angle_ticks(i), max_r);
         line(ax1, [0 x_label], [0 y_label], 'Color',[0.5 0.5 0.5],'LineStyle','--');
-        line(ax2, [0 x_label], [0 y_label], 'Color',[0.5 0.5 0.5],'LineStyle','--');
     end
     
     title(ax1, sprintf('%s Wave–Rose', labelStr), 'FontSize',12, 'FontWeight','bold');
@@ -843,7 +839,6 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
     ax1_pos = ax1.Position;
     ax1_pos(3) = ax1_pos(3) * 0.85;
     ax1.Position = ax1_pos;
-    ax2.Position = ax1_pos;
     
     if saverose
         roseFileName = fullfile(outDir, sprintf('%s.png', outName));
@@ -852,6 +847,7 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
     end
     close(figRose);
 end
+
 %--------------------------------------------------------------------------
 
 function results = extractWaveletFeatures(dataType, spec_full, data_background, squares, ...
