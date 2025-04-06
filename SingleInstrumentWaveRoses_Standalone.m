@@ -22,11 +22,11 @@ km_per_degree = 111.32;       % km per degree
 shrinkfactor = 2;             % Image is resized by this factor (2 => half the resolution)
 invshrinkfactor = 1 / shrinkfactor;
 original_px_km = degrees_per_pixel * km_per_degree;
-pixel_size_km = original_px_km * shrinkfactor;
 
 %----------- WAVELET PARAMETERS -----------------------------
 Angles = 0 : pi/(7*2) : pi;           % Wavelet angles (in radians)
-Scales = [2, 4, 8, 16, 32, 64, 128];       % Wavelet scales in pixel units
+Scales = [2, 4, 8, 16, 32, 64];       % Wavelet scales in pixel units
+Scales_orig = Scales;                 % That will anchor the Scales values in case there's a ShrinkFactor >1
 NANGLES = numel(Angles);                  % Number of angles
 NSCALES = numel(Scales);                  % Number of scales
 
@@ -44,7 +44,7 @@ decay_rate = 10;              % Controls steepness of window edge
 
 %----------- SQUARE-PARTITIONING PARAMETERS ----------------
 window_buffer = 0;          % Number of pixels to ignore at each edge
-square_size_deg = 5;        % Square size (in degrees) for ROI partitioning
+square_size_deg = 10;        % Square size (in degrees) for ROI partitioning
 
 %----------- PREPROCESSING THRESHOLDS -----------------------
 % For IR
@@ -73,25 +73,50 @@ switch upper(instrument)
         error('Unknown instrument: %s', instrument);
 end
 
+%----------- WAVE-ROSE & PEAK DETECTION ---------------------
+nAngles_fineFactor  = 4;            % Factor to refine angular resolution in the rose plot
+nScales_fineFactor  = 4;            % Factor to refine scale resolution in the rose plot
+peakDetectionFactor = 1;            % Threshold factor (mean + factor*std) for peak detection
+contourArray        = [95 97 99];    % [Used as either percentiles or absolute values for contouring]
+ArrayMode           = 'percentile'; % 'percentile' or 'absolute'
+
 %----------- IMAGE ANNOTATIONS & OUTPUT ---------------------
 saverose = true;            % Flag to save the wave–rose image
-DisplayValuePower = 4*10^-3.5;
+DisplayValuePower = 4*10^-2;
 DisplayValueCoherence = 1;
-DisplayValuePhase = [-pi/2;pi/2];
+DisplayValuePhase = [-pi;pi];
 DisplayValueSpeed = [-15;15];
+
+%----------- ADVECTION CORRECTION SETTINGS -----------------
+doAdvectionEstimation = true;     % Set to true to estimate mean advection
+scalesForAdvection = [4, 8, 16, 32];    % Use these pixel scales for advection estimation (central scales)
+cohThreshold = 0.2;               % Only use (scale,angle) bins where coherence (or its square root) is >= 0.2
+amplitudeThreshold = 0;           % (Optional) ignore bins with amplitude below this threshold
+
+%----------- SPEED CORRECTION SETTINGS -------------------
+% you can either play with the parameters or use a specific calibration Matrix
+beta = 0.8;         % Weight for smoothing toward baseline trend
+decayFactor = 0.55;  % Amplitude decay applied to baseline smoothing
+decaySharpness = 1.2;  % Controls how sharply the baseline trend decays with scale
+upperCutoff = 16;  % Upper trusted scale
+nyquistScales= Scales_orig(1:2); % Scales that are likely to be hit by nyquist issue
+
+matrixMode = true;
+calibrationMatrix = [0.5;0.5;0.5;0.4;0.335;0.17;0.083]; % Empirical calibration values
 
 %----------- SYNTHETIC DATA SETTINGS ----------------------
 syntheticWaveMode = true;   % If true, superimpose a synthetic wave on a fixed base image
 driftMode         = true;   % If true, apply a drift shift each frame using circshift
 
 % Drift parameters (in m/s) rather than pixels/frame:
-drift_speed_m_s = 10;       % e.g. 10 m/s
-driftAngleDeg   = 45+90;       % e.g. 45 degrees (0 = right, 90 = up) // the image is inverted !!
+drift_speed_m_s = 15;       % e.g. 10 m/s
+driftAngleDeg   = 45+90+90;       % e.g. 45 degrees (0 = right, 90 = up) // the image is inverted !!
+
 
 % Parameters for the synthetic wave:
 cphase = 15;                   % Phase speed (m/s)
 wavelength = 150e3;            % Wavelength in meters
-direction = 235;               % Propagation direction in degrees
+direction = 235;               % Propagation from direction in degrees
 zamplitude = 100;              % Vertical amplitude (m)
 PBLdepth = 1000;               % Boundary layer depth (m)
 dB_dzPBL = 0.1;                  % dB / (dZ/PBLdepth) | Change of brightness with zamplitude
@@ -100,24 +125,30 @@ dB_dzPBL = 0.1;                  % dB / (dZ/PBLdepth) | Change of brightness wit
 % Parameters for the spatial amplitude window (wave packet)
 packet_center_x = -400e3;
 packet_center_y = -400e3;
-packet_width_x = 400e3;
-packet_width_y = 300e3;
+packet_width_x = 4*400e3;
+packet_width_y = 4*300e3;
 
 % Synthetic wave scaling factor for spatial coordinates
 % This factor modifies DX, which represents the real-world distance per pixel.
 % A smaller DX means that each pixel covers a smaller physical distance, 
 % effectively "zooming in" and making the wave pattern appear larger in the image.
 % Conversely, a larger DX means that each pixel covers a larger real-world distance, 
-% making the wave pattern appear *smaller* and more compressed.
+% making the wave pattern appear smaller and more compressed.
 %
 % Example: 
 %   - DXFactor = 1 means the default scaling (1:1 with pixel size).
 %   - DXFactor = 1/4 means the wave features are stretched, appearing 4x larger.
 %   - DXFactor = 4 means the wave features are shrunk, appearing 4x smaller.
-DXFactor = 1/4;  
+DXFactor = 1;  
 
 % Seconds between frames (important for drift or wave stepping)
 time_resolution = 1800;
+
+%----------- VIDEO OUTPUT SETTINGS -----------------------
+createOutputVideo = true;    % Set to true to generate a video of processed frames
+videoFrameRate = 5;          % Frames per second for the output video
+videoApplyShrink = true;     % Use true to apply shrinkfactor to video frames
+videoApplyWindow = true;     % Use true to apply windowing to video frames
 
  %% 2) GATHER PNG FILES
     if ~exist(rootSepacDir, 'dir')
@@ -150,6 +181,40 @@ time_resolution = 1800;
     numFrames = numel(pngFiles);
     fprintf('Found %d frames for instrument %s.\n', numFrames, instrument);
 
+%% 2.1) OPTIONAL VIDEO GENERATION
+if createOutputVideo && numFrames > 0 % Check if video creation is enabled and frames exist
+    fprintf('\n--- Generating Output Video ---\n');
+
+    singleOutDir = 'C:\Users\admin\Documents\GitHub\Stratocu-Waves-Jr\test';
+
+    % Define output video filename (customize as needed)
+    videoFileName = sprintf('%s_Video_%s_to_%s.mp4', ...
+                        upper(instrument), ...
+                        datestr(fTimes(1), 'yyyymmddHHMM'), ...
+                        datestr(fTimes(end), 'yyyymmddHHMM'));
+    outputVideoFile = fullfile(singleOutDir, videoFileName); % Save in the same test dir
+
+    % Determine if shrinking/windowing should be applied based on script settings AND video flags
+    applyShrinkVideo = videoApplyShrink && (shrinkfactor ~= 1);
+    applyWindowVideo = videoApplyWindow && doWindow;
+
+    % Call the video creation function
+    createVideoFromFrames(fNames, fTimes, dataDir, varName, ...
+                       outputVideoFile, videoFrameRate, ...
+                       applyShrinkVideo, shrinkfactor, invshrinkfactor, ... % Pass shrink args
+                       applyWindowVideo, windowType, radius_factor, decay_rate, ... % Pass window args
+                       instrument, methodName, ... % Pass preprocessing args
+                       IR_threshold, IR_fillPercentile, ...
+                       VIS_lowerPercentile, VIS_upperPercentile, ...
+                       VIS_fillPercentile, clipMinHP, clipMaxHP, ...
+                       lowPassFilterWidth_20, lowPassFilterWidth_50, lowPassFilterWidth_100, ...
+                       Insolation_Correction);
+
+elseif createOutputVideo
+    fprintf('\nVideo creation skipped: No frames were processed.\n');
+end
+
+
 
 %% 3) MAIN PROCESSING LOOP (Single instrument + cross–temporal coherence)
 %    Rewritten to accumulate sums over the entire domain first.
@@ -164,6 +229,14 @@ B2_auto_sum   = [];         % For sum of |B2|^2
 phaseExp_sum = [];
 
 prevWaveletSpec = [];  % Will store wavelet from previous frame for cross–temporal coherence
+
+if shrinkfactor ~= 1
+    pixel_size_km = original_px_km * shrinkfactor;
+    Scales = Scales / shrinkfactor;
+    scalesForAdvection = scalesForAdvection/shrinkfactor; 
+else
+    pixel_size_km = original_px_km;
+end
 
 for f_idx = 1:numFrames
 
@@ -196,7 +269,7 @@ for f_idx = 1:numFrames
             [X, Y] = meshgrid(1:colsF, 1:rowsF);
 
             % Real‐world pixel size (m), factoring in DXFactor:
-            DX = 1000 * pixel_size_km * DXFactor;
+            DX = 1000 * original_px_km * DXFactor;
             Xm = (X - mean(X(:))) * DX;
             Ym = (Y - mean(Y(:))) * DX * -1;  % negative if Y runs downward
         end
@@ -252,7 +325,7 @@ for f_idx = 1:numFrames
         
         % Convert to pixel shift
         driftDistance_km = driftDistance_m / 1000;
-        pxShift = driftDistance_km / (pixel_size_km);  % e.g. if pixel_size_km=9 => pxShift=2000/9
+        pxShift = driftDistance_km / (original_px_km);  % e.g. if pixel_size_km=9 => pxShift=2000/9
         pxShift = round(pxShift);  % round to nearest integer for circshift
         
         % Break it into X shift and Y shift based on the drift angle
@@ -349,13 +422,18 @@ end  % end for f_idx=1:numFrames
 
 % Build ROI squares.
 
-x_buffer_range = (window_buffer+1):(colsF-window_buffer);
-y_buffer_range = (window_buffer+1):(rowsF-window_buffer);
-adjusted_frame_width = length(x_buffer_range);
+effective_degrees_per_pixel = degrees_per_pixel * shrinkfactor;
+square_size_px = round(square_size_deg / effective_degrees_per_pixel);
+
+x_buffer_range = (window_buffer+1) : (colsF - window_buffer);
+y_buffer_range = (window_buffer+1) : (rowsF - window_buffer);
+
+adjusted_frame_width  = length(x_buffer_range);
 adjusted_frame_height = length(y_buffer_range);
-square_size_px = round(square_size_deg / degrees_per_pixel);
-num_squares_x = ceil(adjusted_frame_width / square_size_px);
+
+num_squares_x = ceil(adjusted_frame_width  / square_size_px);
 num_squares_y = ceil(adjusted_frame_height / square_size_px);
+
 squares = [];
 idxS = 1;
 for iy = 1:num_squares_y
@@ -463,19 +541,46 @@ if doWindow
 end
 
 produceOverlayWaveRose('Power', roiPowerCell, squares, num_squares_x, num_squares_y, ...
-                        Scales, Angles, DisplayValuePower, data_bg_pre, singleOutDir, 'Global PowerWaveRose Overlay.png');
+                        Scales_orig, Angles, DisplayValuePower, data_bg_pre, singleOutDir, 'Global PowerWaveRose Overlay.png');
 
 produceOverlayWaveRose('Coherence', roiCohCell, squares, num_squares_x, num_squares_y, ...
-                        Scales, Angles, DisplayValueCoherence, data_bg_pre, singleOutDir, 'Global CoherenceWaveRose Overlay.png');
+                        Scales_orig, Angles, DisplayValueCoherence, data_bg_pre, singleOutDir, 'Global CoherenceWaveRose Overlay.png');
 
 produceOverlayWaveRose('Phase', roiSpeedCell, squares, num_squares_x, num_squares_y, ...
-                        Scales, Angles, DisplayValuePhase, data_bg_pre, singleOutDir, 'Global PhaseWaveRose Overlay.png');
+                        Scales_orig, Angles, DisplayValuePhase, data_bg_pre, singleOutDir, 'Global PhaseWaveRose Overlay.png');
 
 produceOverlayWaveRose('Speed', roiSpeedCell, squares, num_squares_x, num_squares_y, ...
-                        Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global SpeedWaveRose Overlay.png');
+                        Scales_orig, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global SpeedWaveRose Overlay.png');
+
+%% 4C) Final Correction of Large-Scale Speeds
+
+% Apply the correction on the ROI-level wave–rose speeds
+roiSpeedCell_corrected = limitSpeedByScale(roiSpeedCell, Scales_orig, nyquistScales, upperCutoff, beta, decayFactor, decaySharpness, matrixMode);
+
+% Then, you can use produceOverlayWaveRose to visualize the final results:
+produceOverlayWaveRose('Speed Corrected', roiSpeedCell_corrected, squares, num_squares_x, num_squares_y, ...
+    Scales_orig, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global Corrected SpeedWaveRose Overlay.png');
+
+%% 4D) ADVECTION CORRECTION ON ROI-BASED ROSES
+
+if doAdvectionEstimation
+    [roiSpeedCell_corrected, roiResidCell] = ...
+        applyAdvectionCorrectionROI(roiSpeedCell, roiCohCell, ...
+                                   Scales, Angles, ...
+                                   scalesForAdvection, cohThreshold, ...
+                                   pixel_size_km, time_resolution);
+
+    % Apply the correction on the ROI-level wave–rose speeds (for instance, on the advection-corrected data)
+roiSpeedCell_corrected = limitSpeedByScale(roiSpeedCell_corrected, Scales, nyquistScales, upperCutoff, beta, decayFactor, decaySharpness, matrixMode);
+
+
+produceOverlayWaveRose('Speed UnAdvected', roiSpeedCell_corrected, squares, num_squares_x, num_squares_y, ...
+                        Scales_orig, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global UnAdvected SpeedWaveRose Overlay.png');
+
+end
 
 %% 5) GLOBAL AVERAGE WAVE ROSES
-% After Section 3, we have the following accumulators:
+% Aafter Section 3, we have the following accumulators:
 %   power_sum     : sum over frames of |spec_full|^2, size [rowsF, colsF, NSCALES, NANGLES]
 %   crossSpec_sum : sum over consecutive-frame pairs of (B1 .* conj(B2))
 %   B1_auto_sum   : sum over pairs of |B1|^2 (previous frame)
@@ -492,7 +597,7 @@ numPixels   = rowsF * colsF;       % total pixels per frame
 globalPower = squeeze( sum(sum(power_sum, 1, 'omitnan'), 2, 'omitnan') ) ...
               / (totalFrames * numPixels);
 % Produce the global wave–rose plot:
-produceAggregatedWaveRose('Power Global', globalPower, Scales, Angles, ...
+produceAggregatedWaveRose('Power Global', globalPower, Scales_orig, Angles, ...
     singleOutDir, 'Global PowerWaveRose', saverose, DisplayValuePower);
 
 % ----- (B) Global Coherence Wave–Rose -----
@@ -501,7 +606,7 @@ globalB1    = squeeze( sum(sum(B1_auto_sum,   1, 'omitnan'), 2, 'omitnan') );
 globalB2    = squeeze( sum(sum(B2_auto_sum,   1, 'omitnan'), 2, 'omitnan') );
 % Compute coherence (using standard formula: |S12|^2 / (S11*S22)):
 globalCoherence = ( abs(globalCross).^2 ) ./ (globalB1 .* globalB2 );
-produceAggregatedWaveRose('Coherence Global', globalCoherence, Scales, Angles, ...
+produceAggregatedWaveRose('Coherence Global', globalCoherence, Scales_orig, Angles, ...
     singleOutDir, 'Global CoherenceWaveRose', saverose, DisplayValueCoherence);
 
 % ----- (C) Global Speed (Phase) Wave–Rose -----
@@ -509,14 +614,32 @@ produceAggregatedWaveRose('Coherence Global', globalCoherence, Scales, Angles, .
 globalPhaseExp = squeeze( sum(sum(phaseExp_sum, 1, 'omitnan'), 2, 'omitnan') );
 % Average over the number of pairs and spatial domain:
 globalAvgPhase = angle( globalPhaseExp / (numPairs * numPixels) );
-produceAggregatedWaveRose('Speed Global', globalAvgPhase, Scales, Angles, ...
+produceAggregatedWaveRose('Speed Global', globalAvgPhase, Scales_orig, Angles, ...
     singleOutDir, 'Global SpeedWaveRose', saverose, DisplayValueSpeed);
 
 % ----- (D) Global Phase Wave–Rose -----
 % For phase differences, we average the complex exponentials (for circular averaging)
-produceAggregatedWaveRose('Phase Global', globalAvgPhase, Scales, Angles, ...
+produceAggregatedWaveRose('Phase Global', globalAvgPhase, Scales_orig, Angles, ...
     singleOutDir, 'Global PhaseWaveRose', saverose, DisplayValuePhase);
 
+% ----- (E) Global Corrected Speed (Phase) Wave–Rose -----
+% Apply the correction on the global level wave–rose speeds
+globalAvgPhase_corrected = limitSpeedByScale({globalAvgPhase}, Scales_orig, nyquistScales, upperCutoff,  beta, decayFactor, decaySharpness, matrixMode);
+produceAggregatedWaveRose('Speed Corrected Global', cell2mat(globalAvgPhase_corrected), Scales_orig, Angles, ...
+    singleOutDir, 'Global Corrected SpeedWaveRose', saverose, DisplayValueSpeed);
+
+% ----- (F) Global Unadvected Speed (Phase) + Correction Wave–Rose -----
+if doAdvectionEstimation
+    [globalAvgPhase_unadvected, ResidCell] = ...
+        applyAdvectionCorrectionROI(globalAvgPhase_corrected, {globalCoherence}, ...
+                                   Scales, Angles, ...
+                                   scalesForAdvection, cohThreshold, ...
+                                   pixel_size_km, time_resolution);
+
+    produceAggregatedWaveRose('Speed UnAdvected', cell2mat(globalAvgPhase_unadvected),Scales_orig, Angles, ...
+        singleOutDir,  'Global UnAdvected SpeedWaveRose.png', saverose, DisplayValueSpeed);
+
+end
 
 fprintf('\nAll done. Single–frame and cross–temporal wavelet (coherence) computations complete.\n');
 
@@ -559,9 +682,15 @@ function produceOverlayWaveRose(metricLabel, roiCell, squares, num_squares_x, nu
     yLim    = axMain.YLim;              % e.g. [1, Ny]
     
     % Set inset scaling and offsets.
-    sizeFactor = 1.5;    % Factor to enlarge each inset.
-    xOffset   = 0.01; % Horizontal offset between insets.
-    yOffset   = 0.075;  % Vertical offset between insets.
+    if evalin('base','shrinkfactor')==2
+        sizeFactor = 1.5;    % Factor to enlarge each inset.
+        xOffset   = 0.01; % Horizontal offset between insets.
+        yOffset   = 0.075;  % Vertical offset between insets.
+    elseif evalin('base','shrinkfactor')==1
+        sizeFactor = 1;
+        xOffset   = -0.027; % Horizontal offset between insets.
+        yOffset   = 0;  % Vertical offset between insets.
+    end
     
     % Loop over all ROIs.
     for iy = 1:num_squares_y
@@ -576,20 +705,30 @@ function produceOverlayWaveRose(metricLabel, roiCell, squares, num_squares_x, nu
             yMax = max(roi.y_range);
             width  = xMax - xMin + 1;
             height = yMax - yMin + 1;
-            
-            % Convert ROI data coordinates to figure–normalized coordinates.
-            xNorm = posMain(1) + ((xMin - xLim(1)) / (xLim(2) - xLim(1))) * posMain(3);
-            wNorm = (width / (xLim(2) - xLim(1))) * posMain(3) * sizeFactor;
-            yNorm = posMain(2) + ((yLim(2) - yMax) / (yLim(2) - yLim(1))) * posMain(4);
-            hNorm = (height / (yLim(2) - yLim(1))) * posMain(4) * sizeFactor;
+            if evalin('base','shrinkfactor')==2
+                xNorm = posMain(1) + ((xMin - xLim(1)) / (xLim(2) - xLim(1))) * posMain(3);
+                wNorm = (width / (xLim(2) - xLim(1))) * posMain(3) * sizeFactor;
+                yNorm = posMain(2) + ((yLim(2) - yMax) / (yLim(2) - yLim(1))) * posMain(4);
+                hNorm = (height / (yLim(2) - yLim(1))) * posMain(4) * sizeFactor;
+            elseif evalin('base','shrinkfactor')==1
+                % Convert ROI data coordinates to figure–normalized coordinates.
+                xNorm = posMain(1) + ((xMin - xLim(1)) / (xLim(2) - xLim(1))) * posMain(3)*sizeFactor;
+                wNorm = (width / (xLim(2) - xLim(1))) * posMain(3) * sizeFactor;
+                yNorm = posMain(2) + ((yLim(2) - yMax) / (yLim(2) - yLim(1))) * posMain(4)*sizeFactor;
+                hNorm = (height / (yLim(2) - yLim(1))) * posMain(4) * sizeFactor;
+            end
             
             % Adjust for spacing between insets.
             xNorm = xNorm + (ix - 1) * xOffset;
             yNorm = yNorm - (iy - 1) * yOffset;
             
             % Create an inset axes at the computed position.
-            axInset = axes('Position', [xNorm+0.155, yNorm-0.08, wNorm, hNorm]);
-            
+            if evalin('base','shrinkfactor')==2
+                axInset = axes('Position', [xNorm+0.155, yNorm-0.08, wNorm, hNorm]);
+            elseif evalin('base','shrinkfactor')==1
+                axInset = axes('Position', [xNorm+0.07, yNorm, wNorm, hNorm]);
+            end
+
             % Retrieve the corresponding wave–rose matrix.
             roiMatrix = roiCell{idxS};
             
@@ -663,9 +802,10 @@ function DisplayAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, axHand
    
     if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
         pixel_size_km = evalin('base','pixel_size_km');
+        shrinkfactor = evalin('base','shrinkfactor');
         % For each row (corresponding to a fine-scale value), multiply by that scale.
         for iRow = 1:size(innerpower,1)
-             innerpower(iRow, :) = (pixel_size_km*1000*(innerpower(iRow, :)/(2*pi)) .* Scales(iRow)* pi/sqrt(2))/1800;
+             innerpower(iRow, :) = (pixel_size_km*1000*(innerpower(iRow, :)/(2*pi)) .* Scales(iRow)* pi/sqrt(2))/(1800*shrinkfactor);
         end
     end
     
@@ -749,8 +889,10 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
     % --- Modification for Speed ---
     if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
         pixel_size_km = evalin('base','pixel_size_km');
+        shrinkfactor = evalin('base','shrinkfactor');
+        % For each row (corresponding to a fine-scale value), multiply by that scale.
         for iRow = 1:size(innerpower,1)
-            innerpower(iRow, :) = (pixel_size_km*1000*(innerpower(iRow, :)/(2*pi)) .* Scales(iRow)* pi/sqrt(2))/1800;
+             innerpower(iRow, :) = (pixel_size_km*1000*(innerpower(iRow, :)/(2*pi)) .* Scales(iRow)* pi/sqrt(2))/(1800*shrinkfactor);
         end
     end
 
@@ -760,7 +902,7 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
     padded_power = padarray(innerpower, [1 1], NaN, 'post'); % Add NaNs to edges
    
     % Create figure and plot
-    figRose = figure('visible','on');
+    figRose = figure('visible','off');
     set(figRose, 'Position', [100 100 600 600]);
     ax1 = axes('Position',[0.1 0.1 0.75 0.75]);
     hold(ax1, 'on');
@@ -848,7 +990,436 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
     close(figRose);
 end
 
-%--------------------------------------------------------------------------
+%==========================================================================
+function [u, alpha] = estimateAdvectionFromPhase(pdifrose, cohrose, Scales, Angles, ...
+                                                 scalesForAdvection, cohThreshold, pixel_size_km, dt)
+% estimateAdvectionFromPhase estimates the advection speed (u) and direction (alpha)
+% from the averaged phase differences and coherence.
+%
+% Inputs:
+%   pdifrose         : [NSCALES x NANGLES] matrix of mean phase differences (in radians)
+%   cohrose          : [NSCALES x NANGLES] matrix of coherence (or coherence^2)
+%   Scales           : vector of scales in pixels [NSCALES x 1]
+%   Angles           : vector of angles in radians [1 x NANGLES]
+%   scalesForAdvection: vector of scales to use (e.g. [4, 8, 16])
+%   cohThreshold     : Coherence threshold; ignore bins with coherence < cohThreshold
+%   pixel_size_km    : km per pixel (after scaling)
+%   dt               : Time interval between frames (in seconds)
+%
+% Outputs:
+%   u     : Estimated advection speed in m/s
+%   alpha : Estimated advection direction (in radians)
+
+% Select only the desired scales
+mask_scales = ismember(Scales, scalesForAdvection);
+pdif_sel = pdifrose(mask_scales, :);
+coh_sel  = sqrt(cohrose(mask_scales, :));  % If cohrose is gamma^2, take the square root
+S_sel    = Scales(mask_scales);
+
+% Mask out bins where coherence is below the threshold
+coh_mask = (coh_sel >= cohThreshold);
+pdif_sel(~coh_mask) = NaN;
+
+% Convert the scales (in pixels) into wavelengths in meters.
+% (Assuming one cycle = π radians)
+lambda_sel = S_sel * (pixel_size_km*1000) * (pi / sqrt(2));
+
+% Use fminsearch to find the (u, alpha) that minimizes the phase error
+x0 = [5, pi/2];  % initial guess: u=5 m/s, alpha=pi/2
+opts = optimset('Display','none');
+x_opt = fminsearch(@(x) costFun(x, pdif_sel, coh_sel, Angles, lambda_sel, dt), x0, opts);
+
+u     = x_opt(1);
+alpha = x_opt(2);
+end
+
+function err = costFun(x, pdif, coh, Angles, lambda, dt)
+% costFun computes the weighted mean square error between observed phase and
+% predicted phase for a given u and alpha.
+%
+% Inputs:
+%   x     : [u, alpha]
+%   pdif  : Observed phase differences [nSelScales x NANGLES]
+%   coh   : Coherence weights for the selected bins [nSelScales x NANGLES]
+%   Angles: Vector of angles (radians)
+%   lambda: Vector of wavelengths corresponding to selected scales (in meters)
+%   dt    : Time resolution (in seconds)
+%
+% Output:
+%   err   : Mean squared error (weighted by coherence)
+
+u     = x(1);
+alpha = x(2);
+[nSc, nAng] = size(pdif);
+phi_pred = zeros(nSc, nAng);
+
+% Compute the predicted phase for each scale and angle:
+% phi_pred(s, theta) = ((u*dt)/lambda_s) * cos(theta - alpha) * pi
+for iS = 1:nSc
+    for iA = 1:nAng
+        phi_pred(iS,iA) = ((u*dt)/lambda(iS)) * cos(Angles(iA)-alpha) * pi;
+    end
+end
+
+% Compute the phase difference robustly using complex representation
+diffPhase = angle(exp(1i*(pdif - phi_pred)));
+% Weight by the coherence (or amplitude)
+w = coh;
+err = nanmean( (w(:).*diffPhase(:)).^2 );
+end
+
+function [roiSpeedCell_corrected, roiResidCell] = applyAdvectionCorrectionROI( ...
+    roiSpeedCell, roiCohCell, ...
+    Scales, Angles, ...
+    scalesForAdvection, cohThreshold, ...
+    pixel_size_km, dt)
+% APPLYADVECTIONCORRECTIONROI
+%   Loops over each ROI, retrieves the average phase (roiSpeedCell{iROI}),
+%   estimates a global advection (u, alpha), then subtracts that advection's
+%   predicted phase from the observed phase. Returns the corrected wave–rose
+%   (roiSpeedCell_corrected) and an optional residual (roiResidCell).
+%
+%   Inputs:
+%     roiSpeedCell  : cell array of [NSCALES x NANGLES] average phase
+%     roiCohCell    : cell array of [NSCALES x NANGLES] coherence^2
+%     Scales, Angles: wavelet scales (pixels) and angles (radians)
+%     scalesForAdvection : subset of scales to use for the advection fit
+%     cohThreshold       : ignore scale–angle bins with coherence < threshold
+%     pixel_size_km      : real distance per pixel (km)
+%     dt                 : time resolution (seconds)
+%
+%   Outputs:
+%     roiSpeedCell_corrected : same size as roiSpeedCell, but with
+%                              the large-scale advection subtracted out
+%     roiResidCell           : an alternate "residual" measure (optional)
+
+    numROI = numel(roiSpeedCell);
+    roiSpeedCell_corrected = cell(size(roiSpeedCell));
+    roiResidCell           = cell(size(roiSpeedCell));
+
+    for iR = 1:numROI
+        % 1) Extract the naive average phase (pdifrose) and coherence^2 for this ROI
+        pdifrose = roiSpeedCell{iR};   % [NSCALES x NANGLES]
+        cohrose  = roiCohCell{iR};     % [NSCALES x NANGLES], i.e. gamma^2
+
+        % 2) Estimate the advection
+        [u_hat, alpha_hat] = estimateAdvectionFromPhase( ...
+            pdifrose, cohrose, ...
+            Scales, Angles, ...
+            scalesForAdvection, cohThreshold, ...
+            pixel_size_km, dt);
+
+        % 3) Build the theoretical advection phase for each scale, angle
+        NSCALES  = numel(Scales);
+        NANGLES  = numel(Angles);
+        phi_adv  = zeros(NSCALES, NANGLES);
+        for iS = 1:NSCALES
+            lambda_m = Scales(iS) * (pixel_size_km*1000) * pi/sqrt(2);  % wavelength in meters
+            for iA = 1:NANGLES
+                phi_adv(iS,iA) = ((u_hat*dt)/lambda_m) * cos(Angles(iA) - alpha_hat) * pi;
+            end
+        end
+
+        % 4) Subtract that from the observed phase (pdifrose)
+        %    We'll do a robust difference: residualPhase = angle( e^{i( pdif - phi_adv )} ).
+        diffPhase = pdifrose - phi_adv;
+        residualPhase = angle( exp(1i * diffPhase) );
+
+        % 5) Optionally store the "corrected" wave–rose
+        %    You can interpret this as "phase minus advection". 
+        roiSpeedCell_corrected{iR} = residualPhase;
+
+        % 6) If desired, also store the difference in raw form
+        %    (e.g., a simple difference in degrees)
+        rawDiff = diffPhase;  % or convert to degrees, etc.
+        roiResidCell{iR} = rawDiff; 
+    end
+end
+
+%==========================================================================
+function roiSpeedCell_final = limitSpeedByScale(roiSpeedCell_in, Scales, nyquistScales, upperCutoff, alpha, decayFactor, decaySharpness, matrixMode)
+% LIMITSPEEDBYSCALE Corrects phase wrapping (Nyquist) and smooths large scales.
+%
+%   roiSpeedCell_final = limitSpeedByScale(roiSpeedCell_in, Scales, nyquistScales, upperCutoff, alpha)
+%
+% Inputs:
+%   roiSpeedCell_in : Cell array of [NSCALES x NANGLES] phase matrices
+%   Scales          : Vector of scale values
+%   nyquistScales   : Scales to apply Nyquist correction (e.g., [1:4])
+%   upperCutoff     : Upper scale cutoff for trend smoothing
+%   alpha           : Smoothing factor for large scales [0,1]
+%
+% Output:
+%   roiSpeedCell_final : Corrected phase data
+% Version 2: Local Nyquist correction + constrained trend
+
+nROI = numel(roiSpeedCell_in);
+roiSpeedCell_final = cell(size(roiSpeedCell_in));
+phaseJumpThreshold = pi * 0.6; % More conservative threshold
+zeroPhaseThreshold = 1; % Threshold to detect near-zero phase points (radians)
+
+for iR = 1:nROI
+    currentWave = roiSpeedCell_in{iR};
+    [nScales, nAngles] = size(currentWave);
+    
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% Step 1: Local Nyquist Correction
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    nyquistMask = ismember(Scales, nyquistScales);    
+    correctedWave = currentWave;
+
+    % Calculate trusted profile from non-Nyquist scales
+    trustedScalesMask = ~ismember(Scales, nyquistScales);
+    trustedProfile = mean(currentWave(trustedScalesMask, :), 1);
+
+    for s = find(nyquistMask)
+         % Detect near-zero phase points
+        if ~isempty(find(abs(correctedWave(s,:)) < zeroPhaseThreshold))
+                candidates = find(abs(correctedWave(s,:)) < zeroPhaseThreshold);
+                if numel(candidates) > 1
+                    % Generation of variants
+                    variants = cell(numel(candidates), 1);
+                    scores = zeros(numel(candidates), 1);
+
+                    for c = 1:numel(candidates)
+                        variant = correctedWave(s,:);
+                        anchor = candidates(c);
+                        
+                        % Left Correction 
+                        for a = anchor-1:-1:1
+                            delta = variant(a+1) - variant(a);
+                            if abs(delta) > phaseJumpThreshold
+                                variant(a) = variant(a) + round(delta/(2*pi))*2*pi;
+                            end
+                        end
+                        
+                        % Right Correction 
+                        for a = anchor+1:nAngles
+                            delta = variant(a) - variant(a-1);
+                            if abs(delta) > phaseJumpThreshold
+                                variant(a) = variant(a) - round(delta/(2*pi))*2*pi;
+                            end
+                        end
+                        
+                        % Calculate score as RMSE from trusted profile (NEW)
+                        scores(c) = sqrt(mean((variant - trustedProfile).^2));
+                        variants{c} = variant;
+                    end
+
+                    % Select variant with smallest distance to trusted profile
+                    [~, bestIdx] = min(scores);
+                    correctedWave(s,:) = variants{bestIdx};
+
+                else
+
+                    [~, anchorIdx] = min(abs(correctedWave(s,:)));  % Finds global minimum index
+        
+                    % Correct leftward from anchor
+                    for a = (anchorIdx-1):-1:1
+                        delta = correctedWave(s,a) - correctedWave(s,a+1);
+                        if delta > pi
+                            correctedWave(s,a) = correctedWave(s,a) - 2*pi;
+                        elseif delta < -pi
+                            correctedWave(s,a) = correctedWave(s,a) + 2*pi;
+                        end
+                    end
+        
+                    % Correct rightward from anchor
+                    for a = (anchorIdx+1):nAngles
+                        delta = correctedWave(s,a) - correctedWave(s,a-1);
+                        if delta > pi
+                            correctedWave(s,a) = correctedWave(s,a) - 2*pi;
+                        elseif delta < -pi
+                            correctedWave(s,a) = correctedWave(s,a) + 2*pi;
+                        end
+                    end
+
+                end
+        else   
+            %%% cissors method %%%
+            % First pass: left → right
+            for a = 2:nAngles
+                delta = correctedWave(s,a) - correctedWave(s,a-1);
+                if abs(delta) > phaseJumpThreshold
+                    if delta > pi
+                        correctedWave(s,a) = correctedWave(s,a) - 2*pi;
+                    elseif delta < -pi
+                        correctedWave(s,a) = correctedWave(s,a) + 2*pi;
+                    end
+                end
+            end
+    
+            % second pass: right → left (compensation)
+            for a = (nAngles-1):-1:1
+                delta = correctedWave(s,a) - correctedWave(s,a+1);
+                if abs(delta) > phaseJumpThreshold
+                    if delta > pi
+                        correctedWave(s,a) = correctedWave(s,a) - 2*pi;
+                    elseif delta < -pi
+                        correctedWave(s,a) = correctedWave(s,a) + 2*pi;
+                    end
+                end
+            end
+    
+            %%% Result merging %%%
+            % Weighted Mean of the two passes 
+            correctedWave(s,:) = 0.5*(correctedWave(s,:) + flip(correctedWave(s,:)));
+        end
+    end
+
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% Step 2: Constrained Trend Smoothing
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    trustedMask = (Scales > max(nyquistScales)) & (Scales <= upperCutoff);
+    %%
+    if any(trustedMask)
+        % Calculate baseline trend with scale-dependent decay
+        if matrixMode 
+            Matrix = evalin('base','calibrationMatrix'); 
+            baseline = mean(correctedWave(trustedMask,:), 1).*Matrix(1:width(Scales)) ;         
+        else
+            baseline = mean(correctedWave(trustedMask,:), 1).* exp(-decaySharpness*Scales'/max(Scales))*decayFactor;
+        end
+        
+    else
+        baseline = zeros(nScales, 1);
+    end
+
+    % Apply constrained smoothing for large scales
+    for s = find(Scales > upperCutoff)'
+        correctedWave(s,:) = alpha*baseline(s,:) + (1-alpha)*correctedWave(s,:);
+    end
+
+    roiSpeedCell_final{iR} = correctedWave;
+end
+end
+
+%==========================================================================
+
+%% HELPER FUNCTION - VIDEO CREATION
+%==========================================================================
+function createVideoFromFrames(fNames, fTimes, dataDir, varName, ...
+                               outputVideoFile, frameRate, ...
+                               applyShrink, shrinkfactor, invshrinkfactor, ...
+                               applyWindow, windowType, radius_factor, decay_rate, ...
+                               instrument, methodName, ...
+                               IR_threshold, IR_fillPercentile, ...
+                               VIS_lowerPercentile, VIS_upperPercentile, ...
+                               VIS_fillPercentile, clipMinHP, clipMaxHP, ...
+                               lpWidth20, lpWidth50, lpWidth100, ...
+                               Insolation_Correction)
+%CREATEVIDEOFROMFRAMES Creates a video from a sequence of preprocessed frames.
+%
+%   Inputs:
+%       fNames, fTimes, dataDir, varName: File information.
+%       outputVideoFile: Full path for the output MP4 video file.
+%       frameRate: Desired frame rate for the video.
+%       applyShrink: Boolean, true to apply resizing based on shrinkfactor.
+%       shrinkfactor, invshrinkfactor: Resizing factors.
+%       applyWindow: Boolean, true to apply windowing.
+%       windowType, radius_factor, decay_rate: Windowing parameters.
+%       instrument, methodName, ... : All preprocessing parameters matching the main script.
+%
+%   Note: This function re-reads and re-processes frames. For videos showing
+%         synthetic waves or drift, video creation might need to be integrated
+%         *within* the main loop to capture the exact frame modifications.
+
+    numFrames = numel(fNames);
+    if numFrames == 0
+        fprintf('No frames provided to create video.\n');
+        return;
+    end
+
+    fprintf('Creating video: %s\n', outputVideoFile);
+
+    % --- Initialize Video Writer ---
+    try
+        writerObj = VideoWriter(outputVideoFile, 'MPEG-4'); % Using MPEG-4 for compatibility
+        writerObj.FrameRate = frameRate;
+        open(writerObj);
+    catch ME
+        fprintf('Error initializing VideoWriter: %s\n', ME.message);
+        fprintf('Video creation failed.\n');
+        return;
+    end
+
+    % --- Loop through frames ---
+    for f_idx = 1:numFrames
+        thisFileName = fNames{f_idx};
+        thisFullPath = fullfile(dataDir, thisFileName);
+        thisTime = fTimes(f_idx);
+        fprintf('  Adding frame %d/%d: %s\n', f_idx, numFrames, thisFileName);
+
+        % ---- Read the raw data ----
+        try
+            data = double(ncread(thisFullPath, varName));
+        catch readME
+            fprintf('  Warning: Could not read frame %s. Skipping. Error: %s\n', thisFileName, readME.message);
+            continue; % Skip to next frame
+        end
+
+        % ---- Preprocessing (Identical to main loop) ----
+        % NOTE: If syntheticWaveMode or driftMode was true in the main script,
+        % this video frame *won't* include those effects unless you add
+        % that logic here as well (which would require passing many more parameters).
+        data_pre = preprocessFrame(data, instrument, methodName, ...
+                    thisFullPath, thisTime, ...
+                    IR_threshold, IR_fillPercentile, ...
+                    VIS_lowerPercentile, VIS_upperPercentile, ...
+                    VIS_fillPercentile, clipMinHP, clipMaxHP, ...
+                    lpWidth20, lpWidth50, lpWidth100, ...
+                    Insolation_Correction);
+
+        % ---- Optional Resize ----
+        if applyShrink && shrinkfactor ~= 1
+            data_pre = imresize(data_pre, invshrinkfactor);
+        end
+
+        % ---- Optional Windowing ----
+        if applyWindow
+            switch lower(windowType)
+                case 'radial'
+                    data_pre = applyRadialWindow(data_pre, radius_factor, decay_rate);
+                case 'rectangular'
+                    data_pre = applyRectangularWindow(data_pre, radius_factor, decay_rate);
+            end
+        end
+
+        % ---- Prepare Frame for Video ----
+        % Normalize frame to [0, 1] for consistent visualization
+        minVal = min(data_pre(:));
+        maxVal = max(data_pre(:));
+        if maxVal > minVal
+            frame_norm = (data_pre - minVal) / (maxVal - minVal);
+        else
+            frame_norm = zeros(size(data_pre), 'like', data_pre); % Handle constant frame
+        end
+
+        % Convert to uint8 [0, 255] and then to RGB
+        frame_uint8 = uint8(frame_norm * 255);
+        frame_rgb = cat(3, frame_uint8, frame_uint8, frame_uint8); % Make grayscale RGB
+
+        % ---- Write Frame to Video ----
+        try
+            writeVideo(writerObj, frame_rgb);
+        catch writeME
+            fprintf('  Warning: Could not write frame %d. Skipping. Error: %s\n', f_idx, writeME.message);
+            % Consider closing the video writer if errors persist
+        end
+    end
+
+    % --- Finalize Video ---
+    try
+        close(writerObj);
+        fprintf('Video creation complete: %s\n', outputVideoFile);
+    catch closeME
+        fprintf('Error closing VideoWriter: %s\n', closeME.message);
+    end
+end
+
+%==========================================================================
+
+%==========================================================================
 
 function results = extractWaveletFeatures(dataType, spec_full, data_background, squares, ...
     Scales, Angles, frameDateStr, ...
