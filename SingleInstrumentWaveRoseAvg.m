@@ -84,8 +84,8 @@ end
 nAngles_fineFactor  = 4;            % Factor to refine angular resolution in the rose plot
 nScales_fineFactor  = 4;            % Factor to refine scale resolution in the rose plot
 peakDetectionFactor = 1;            % Threshold factor (mean + factor*std) for peak detection
-contourArray        = [95 97 99];    % [Used as either percentiles or absolute values for contouring]
-ArrayMode           = 'percentile'; % 'percentile' or 'absolute'
+%contourArray        = [95 97 99];    % [Used as either percentiles or absolute values for contouring]
+%ArrayMode           = 'percentile'; % 'percentile' or 'absolute'
 
 %----------- IMAGE ANNOTATIONS & OUTPUT ---------------------
 saverose = true;            % Flag to save the wave–rose image
@@ -174,7 +174,7 @@ maxPeaksPerROI        = 3;         % safety cap (set [] for unlimited)
 clevfactor_real       = 1.5;       % divides contour levels (real)
 clevfactor_imag       = 2;         % divides contour levels (imag)
 contourOption       = 'percentile';           % 'percentile' | '3sigma'
-contourArray        = [95 97 99];             % if 'percentile'
+contourArray        = [50 60 70];             % if 'percentile'
 
 radStep_pixels      = 2;       % width of annuli (original-res pixels)
 radMax_pixels       = 120;     % stop radius for B-decay
@@ -301,13 +301,18 @@ for f_idx = 1:numFrames
 
     % ---- Synthetic wave injection (if enabled) ----
     if syntheticWaveMode
-        % Compute wave parameters
-        k = (2 * pi / wavelength) * cosd(direction);
-        l = (2 * pi / wavelength) * sind(direction);
-        omega = cphase * (2 * pi / wavelength);
+
+        % --- meteo → math angle conversion (0° = Est, trigonometrical direction) ---
+        theta = deg2rad(90 - direction);    % direction given in meteorological convention
         
+        % --- wave vector ---
+        k = (2*pi / wavelength) * cos(theta);   % kx
+        l = (2*pi / wavelength) * sin(theta);   % ky  (kept for phase)
+        omega = cphase * (2 * pi / wavelength);
+
         % Time for current frame
         t = (f_idx - 1) * time_resolution;  % e.g. in seconds
+
         
         % Evolving phase
         phase = k * Xm + l * Ym - omega * t;
@@ -320,10 +325,12 @@ for f_idx = 1:numFrames
                         + ((Ym - packet_center_y) / packet_width_y).^2) );
         dz = dz .* Ampwindow;
 
-        % Optionally, compute horizontal displacements:
-        dxy = (zamplitude / PBLdepth) * wavelength * sin(phase - pi/2) / DX;
-        dx = dxy .* cosd(direction) .* Ampwindow;
-        dy = dxy .* sind(direction) .* Ampwindow;
+
+        % --- horizontal displacement associayted to w' ---
+        dxy = (zamplitude / PBLdepth) * wavelength .* ...
+               sin(phase - pi/2) ./ DX;          % scalar amplitude in px
+        dx  = dxy .* cos(theta).* Ampwindow;                 % composante O-E  (columns)
+        dy  = dxy .* sin(theta).* Ampwindow;                 % composante S-N  (lines)
         
         % Create new coordinates for interpolation:
         XI = X - dx;
@@ -662,7 +669,13 @@ end
 fprintf('\nAll done. Single–frame and cross–temporal wavelet (coherence) computations complete.\n');
 
 %% 6) PEAK-OVERLAY – draw real & imaginary contours of gravity-wave peaks
+% ----------BEFORE STARTUP, BUILD ONE ANNOTATION CUBE FOR THE WHOLE FRAME ----------
+Ny = size(data_bg_pre,1);   % full-res dims (after any resize/window)
+Nx = size(data_bg_pre,2);
 
+crestMask2D  = false(Ny, Nx); % 1 = crest
+troughMask2D = false(Ny, Nx); % 1 = trough
+realSum2D     = zeros (Ny, Nx, 'single'); % signed Σ(real(coeff_full))
 
 spec_vis = spec_full;          % size = Ny × Nx × NSCALES × NANGLES
 
@@ -685,31 +698,57 @@ for iROI = 1:numSquares
     mu   = mean(speedMat(:),'omitnan');
     sigma= std( speedMat(:),'omitnan');
     thr  = max(speed_min_threshold, mu + speed_std_factor*sigma);
+    
+    speedVals = abs(speedMat);
 
-    [scale_idx_all, angle_idx_all] = find(abs(speedMat) >= thr);
-    if isempty(scale_idx_all),  continue,  end    % nothing to draw
+    visited   = false(size(speedVals));
+    
+    % we will collect blobs in a struct array
+    blobList  = struct('members',{},'maxAmp',{});   
 
-    % Rank peaks by absolute speed (largest first) ---------------------
-    speedVals = abs(speedMat(sub2ind(size(speedMat),...
-                    scale_idx_all, angle_idx_all)));
-    [~, order] = sort(speedVals,'descend');
-    scale_idx_all  = scale_idx_all(order);
-    angle_idx_all  = angle_idx_all(order);
-
-    if ~isempty(maxPeaksPerROI)
-        scale_idx_all = scale_idx_all(1:min(end,maxPeaksPerROI));
-        angle_idx_all = angle_idx_all(1:min(end,maxPeaksPerROI));
-    end
-
-    % For every kept peak draw contours --------------------------------
-    for kk = 1:numel(scale_idx_all)
-        sIdx = scale_idx_all(kk);
-        aIdx = angle_idx_all(kk);
-
-        % Extract & resize the complex coefficient --------------------
-        wav_c = spec_vis(:,:,sIdx,aIdx);            % Ny × Nx
-        wav_real = real(wav_c);
-        wav_imag = imag(wav_c);
+    while true
+        % 1) find the strongest un-visited seed -----------------------------
+        speedVals(visited) = -inf;                        % mask out visited
+        [peakAmp, linearIdx] = max(speedVals(:));
+        if peakAmp < thr, break, end                    % nothing above threshold
+    
+        [sSeed,aSeed] = ind2sub(size(speedVals), linearIdx);
+    
+        % 2) flood-fill ------------------------------------------------------
+        thisBlob  = [];               % list of (s,a)
+        queue     = [sSeed, aSeed];
+    
+        while ~isempty(queue)
+            s = queue(1,1);  a = queue(1,2);
+            queue(1,:) = [];                         % pop
+            if visited(s,a), continue, end
+            visited(s,a) = true;                     % mark now
+    
+            if abs(speedMat(s,a)) < thr, continue, end
+    
+            thisBlob(end+1,:) = [s,a];               %#ok<AGROW>
+    
+            % enqueue 8-neighbours with angle wrap
+            for ds = -1:1
+                for da = -1:1
+                    if ds==0 && da==0, continue, end
+                    ss = s + ds;
+                    aa = mod(a - 1 + da, NANGLES) + 1;
+                    if ss>=1 && ss<=NSCALES && ~visited(ss,aa)
+                        queue(end+1,:) = [ss, aa];    %#ok<AGROW>
+                    end
+                end
+            end
+        end
+    
+        % 3) aggregate complex coefficients over this blob ------------------
+        wav_c_blob = zeros(round(Ny/shrinkfactor), round(Nx/shrinkfactor), 'like', spec_vis(:,:,1,1));
+        for jj = 1:size(thisBlob,1)
+            sIdx = thisBlob(jj,1);   aIdx = thisBlob(jj,2);
+            wav_c_blob = wav_c_blob + spec_vis(:,:,sIdx,aIdx);
+        end
+        wav_real = real(wav_c_blob);
+        wav_imag = imag(wav_c_blob);
 
         % Optionally restrict the display to the current ROI only ----
         mask = false(size(wav_real));
@@ -744,7 +783,38 @@ for iROI = 1:numSquares
             otherwise
                 error('Unknown contour option. Choose either "3sigma" or "percentile".');
         end
+
+        %=====  up-sample to full resolution  ======================
+        if shrinkfactor ~= 1
+            coeff_full  = imresize(wav_c_blob,   shrinkfactor, 'bilinear');  % complex
+            mask_full   = imresize(mask,    shrinkfactor, 'nearest')>0;
+            coeff_full = coeff_full(1:end-1,:);
+            mask_full = mask_full(1:end-1,:);
+        else
+            coeff_full  = wav_c_blob;   % already full-res
+            mask_full   = mask;
+        end
         
+        % Recaculate the level like above
+        switch lower(contourOption)
+          case 'percentile'
+            lev = prctile(abs(real(coeff_full(mask_full))), contourArray(1));
+          case '3sigma'
+            lev = std(real(coeff_full(mask_full)), 'omitnan');
+        end
+        
+        % create the two 2D masks
+        crest  = ( real(coeff_full) >=  lev ) & mask_full;
+        trough = ( real(coeff_full) <= -lev ) & mask_full;
+        
+        % Merges with the global masks
+        crestMask2D  = crestMask2D  | crest;
+        troughMask2D = troughMask2D | trough;
+        realSum2D     = realSum2D  +  single(real(coeff_full) .* mask_full);                   
+       
+        % optional: keep a list of blobs for later ranking
+        blobList(end+1).members = thisBlob;            %#ok<AGROW>
+        blobList(end).maxAmp   = peakAmp;
     end
 
     % Draw ROI rectangle so the user knows which square is which -------
@@ -764,184 +834,323 @@ close(figPeak);
 
 fprintf('Saved peak-overlay to: %s\n', peakFileName);
 
-%% 6.1) BRIGHTNESS-DECAY ANALYSIS  __________________________________
+% --- NetCDF export --------------------------------
+outNC = makeParallelName(singleOutDir, '.spectralpeaks');
+if exist(outNC,'file'), delete(outNC); end
+
+nccreate(outNC,'REAL_SUM', 'Datatype','single', ...
+                     'Dimensions',{'y',Ny,'x',Nx});
+ncwrite (outNC,'REAL_SUM', single(realSum2D));
+
+ncwriteatt(outNC,'/','instrument' ,instrument);
+ncwriteatt(outNC,'/','frameUTC'   ,char(thisTime));
+ncwriteatt(outNC,'/','description', ...
+   'Accumulated real part of selected CWT peaks');
+fprintf('   ↳ wrote REAL_SUM → %s\n', outNC);
+
+
+
+%% 6.1) BRIGHTNESS–DECAY ANALYSIS  ________________________________________
 %
-%  – draws real/imaginary CWT contours (as before)
-%  – extracts ONE “Brightness Point” per positive lobe
-%  – builds a radial Brightness-Decay function     B(r) = ⟨ΔT⟩(r)
-%  – stores all individual profiles → composite   ⟨B(r)⟩
-%  – shows quick-look graphics for each ROI
-%  _______________________________________________________________________
+%  • detects each spectral blob (flood-fill in scale/angle space)
+%  • builds a ridge (skeleton) along the positive real-part lobe
+%  • chooses an anchor pixel (brightest on ridge) – for thumbnails only
+%  • computes B(r) = ⟨ΔT⟩(r) as a function of distance to the whole ridge
+%  • stacks all B(r) profiles → composite curve
+%  • optional: postage-stamp stack around every anchor
+%  ________________________________________________________________________
+
 
 spec_vis   = spec_full;                     % Ny×Nx×NSCALES×NANGLES
 data_full  = data_bg_pre;                   % full-res, pre-processed
 [Ny_full, Nx_full] = size(data_full);
 
-% Collector for composite decay
-radBins   = (0:radStep_pixels:radMax_pixels).';            % column
-nBins     = numel(radBins)-1;
-Bstack    = [];                                            % Npeaks × nBins
+% radial bins for B(r)
+radBins   = (0:radStep_pixels:radMax_pixels).';     % column vector
+nBins     = numel(radBins) - 1;
+Bstack    = [];                                     % Npeaks × nBins
 
-% ------ GO THROUGH EACH ROI --------------------------------------------
+% options for § 6.2
+doPostageStamp   = true;
+doAzimAvg        = true;
+stampHalfSize_px = radMax_pixels;
+saveStampNetCDF  = true;
+
+StackStamp  = [];          % (2H+1)×(2H+1)×N
+StampCtrXY  = [];          % N×2 (cx,cy)
+StampRadProf= [];          % N×nBins
+
+NSCALES  = numel(Scales);
+NANGLES  = numel(Angles);
+
+% -------------------------------------------------------------------------
+%                           LOOP OVER ROIs
+% -------------------------------------------------------------------------
 for iROI = 1:numSquares
 
-    % ---------- 6-A) find peaks exactly as before ----------------------
+    % ---------- A) speed matrix and threshold ---------------------------
     speedMat = roiSpeedCell_corrected{iROI};
     for iRow = 1:size(speedMat,1)
-        speedMat(iRow,:) = (pixel_size_km*1000*(speedMat(iRow,:)/(2*pi)) ...
-                           .* Scales(iRow)*pi/sqrt(2))/(1800*shrinkfactor);
+        speedMat(iRow,:) = ...
+            (pixel_size_km*1000*(speedMat(iRow,:)/(2*pi)) .* ...
+             Scales(iRow) * pi/sqrt(2)) / (1800*shrinkfactor);
     end
+
     xR_sh = squares(iROI).x_range;
     yR_sh = squares(iROI).y_range;
 
-    mu = mean(speedMat(:),'omitnan');
-    sg = std( speedMat(:),'omitnan');
-    thr = max(speed_min_threshold , mu + speed_std_factor*sg);
+    mu  = mean(speedMat(:),'omitnan');
+    sg  = std (speedMat(:),'omitnan');
+    thr = max(speed_min_threshold, mu + speed_std_factor*sg);
 
-    [sIdxAll, aIdxAll] = find(abs(speedMat) >= thr);
-    if isempty(sIdxAll), continue, end
+    speedAbs = abs(speedMat);
+    visited  = false(size(speedAbs));
 
-    % rank peaks by speed
-    speedVals = abs(speedMat(sub2ind(size(speedMat),sIdxAll,aIdxAll)));
-    [~, ord]  = sort(speedVals,'descend');
-    sIdxAll = sIdxAll(ord);
-    aIdxAll = aIdxAll(ord);
-    if ~isempty(maxPeaksPerROI)
-        sIdxAll = sIdxAll(1:min(end,maxPeaksPerROI));
-        aIdxAll = aIdxAll(1:min(end,maxPeaksPerROI));
-    end
+    % ROI indices in full resolution
+    xR_full = ((xR_sh-1)*shrinkfactor)+1 : (xR_sh(end)*shrinkfactor);
+    yR_full = ((yR_sh-1)*shrinkfactor)+1 : (yR_sh(end)*shrinkfactor);
 
-    % ---------- quick-look canvas for this ROI -------------------------
-    if showQuicklooks
-        figQL = figure('Name',sprintf('ROI %d',iROI), ...
-                       'Units','normalized','Position',[.05 .05 .35 .6]);
-        subplot(2,2,1); imagesc(imresize(data_full,invshrinkfactor)); axis image off
-        hold on; rectangle('Position',[xR_sh(1) yR_sh(1) ...
-            numel(xR_sh) numel(yR_sh)],'EdgeColor','c','LineWidth',1.5);
-        title(sprintf('ROI %d context',iROI));
-        colormap gray
-    end
+    % ---------------------------------------------------------------------
+    %                     LOOP OVER BLOBS  (one blob = one crest)
+    % ---------------------------------------------------------------------
+    while true
+        speedAbs(visited) = -inf;
+        [peakAmp, linIdx] = max(speedAbs(:));
+        if peakAmp < thr, break, end
 
-    % convert ROI indices from shrunk → full res once for all
-    xR_full = ((xR_sh-1)*shrinkfactor)+1 : ((xR_sh(end))*shrinkfactor);
-    yR_full = ((yR_sh-1)*shrinkfactor)+1 : ((yR_sh(end))*shrinkfactor);
+        % ---------- quick-look canvas ---------------------------------------
+        if showQuicklooks
+            figQL = figure('Name',sprintf('ROI %d',iROI), ...
+                           'Units','normalized','Position',[.05 .05 .35 .6]);
+            subplot(2,2,1);
+            imagesc(imresize(data_full,invshrinkfactor));
+            axis image off; colormap gray; hold on
+            rectangle('Position',[xR_sh(1) yR_sh(1) ...
+                                  numel(xR_sh) numel(yR_sh)], ...
+                      'EdgeColor','c','LineWidth',1.5);
+            title(sprintf('ROI %d context',iROI));
+        end
 
-    % ---------- 6-B) loop through selected peaks -----------------------
-    for kk = 1:numel(sIdxAll)
-        sIdx = sIdxAll(kk);
-        aIdx = aIdxAll(kk);
+        [sSeed,aSeed] = ind2sub(size(speedAbs), linIdx);
 
-        % a) coefficient & masks in shrunk grid ________________________
-        wav_c   = spec_vis(:,:,sIdx,aIdx);
-        wav_r   = real(wav_c);
+        % --- flood-fill in (scale,angle) space --------------------------
+        thisBlob = [];                        % list of (s,a)
+        queue    = [sSeed, aSeed];
+        while ~isempty(queue)
+            s = queue(1,1); a = queue(1,2); queue(1,:) = [];
+            if visited(s,a), continue, end
+            visited(s,a) = true;
+            if abs(speedMat(s,a)) < thr, continue, end
 
-        maskROI = false(size(wav_r)); maskROI(yR_sh,xR_sh)=true;
+            thisBlob(end+1,:) = [s,a];                  %#ok<AGROW>
+
+            for ds = -1:1
+                for da = -1:1
+                    if ds==0 && da==0, continue, end
+                    ss = s + ds;
+                    aa = mod(a - 1 + da, NANGLES) + 1;
+                    if ss>=1 && ss<=NSCALES && ~visited(ss,aa)
+                        queue(end+1,:) = [ss, aa];      %#ok<AGROW>
+                    end
+                end
+            end
+        end
+
+        % --- aggregate complex coefficients over the blob --------------
+        wav_c_blob = zeros(size(spec_vis(:,:,1,1)),'like',spec_vis);
+        for jj = 1:size(thisBlob,1)
+            wav_c_blob = wav_c_blob + ...
+                         spec_vis(:,:, thisBlob(jj,1), thisBlob(jj,2));
+        end
+        wav_r = real(wav_c_blob);
+
+        % restrict to current ROI
+        maskROI = false(size(wav_r));
+        maskROI(yR_sh,xR_sh) = true;
         wav_r(~maskROI) = NaN;
 
-        % choose positive-lobe threshold
+        % positive-lobe threshold in spatial domain
         switch lower(contourOption)
             case 'percentile'
-                posLevel = prctile(abs(wav_r(:)), contourArray(1)); % 95 %
+                posLevel = prctile(abs(wav_r(:)), contourArray(1));
             case '3sigma'
-                posLevel =  std(wav_r(:),'omitnan');                % ~1 σ
-            otherwise, error('Unknown contour option')
+                posLevel = std(wav_r(:),'omitnan');
+            otherwise
+                error('Unknown contour option');
         end
         maskRed = wav_r >= posLevel;
-        maskRed(~maskROI)=false;
+        maskRed(~maskROI) = false;
 
-        % keep only largest blob
+        % keep largest spatial blob
         CCred = bwconncomp(maskRed,4);
         if CCred.NumObjects==0, continue, end
         [~,bigI] = max(cellfun(@numel,CCred.PixelIdxList));
         maskRed  = false(size(maskRed));
         maskRed(CCred.PixelIdxList{bigI}) = true;
 
-        % b) find ONE Brightness Point ________________________________
-        % option 1 : where wav_r is maximum inside maskRed
-        [~, idxMax] = max(wav_r(maskRed));
-        linInds = find(maskRed);
-        linMax  = linInds(idxMax);
-        [row_sh, col_sh] = ind2sub(size(wav_r), linMax);
+        % --- ridge (skeleton) extraction --------------------------------
+        ridgeMask = bwskel(maskRed);
+        if ~any(ridgeMask(:)), continue, end
+        [ySkel,xSkel] = find(ridgeMask);
 
-        % convert to full-res pixel coords
-        cy = round(row_sh*shrinkfactor);
-        cx = round(col_sh*shrinkfactor);
-        cy = min(max(cy,1), Ny_full);
-        cx = min(max(cx,1), Nx_full);
+        % map ridge to full resolution
+        ridgeMask_full = false(Ny_full,Nx_full);
+        row_full = min(max(round(ySkel*shrinkfactor),1),Ny_full);
+        col_full = min(max(round(xSkel*shrinkfactor),1),Nx_full);
+        ridgeMask_full(sub2ind([Ny_full Nx_full],row_full,col_full)) = true;
 
-        % c) ----- radial Brightness-Decay profile --------------------
-        % ΔT relative to local mean in the ROI (feel free to change)
-        subROI_full = data_full(yR_full, xR_full);
-        baseline    = mean(subROI_full(:),'omitnan');
-        deltaT      = data_full - baseline;  % full frame
+        % anchor = ridge pixel with max ΔT
+        subROI_full = data_full(yR_full,xR_full);
+        baselineROI = mean(subROI_full(:),'omitnan');
+        deltaT_full = data_full - baselineROI;
+        deltaT_on_ridge = deltaT_full(ridgeMask_full);
+        [~,bestIdx] = max(deltaT_on_ridge);
+        cx = col_full(bestIdx);   cy = row_full(bestIdx);
 
-        % distance map
-        [Xf,Yf] = meshgrid(1:Nx_full,1:Ny_full);
-        Rmap    = hypot(Xf-cx, Yf-cy);
 
-        prof    = nan(1,nBins);
-        for jj=1:nBins
+        % --- ridge-centred brightness-decay profile ---------------------
+        Rmap = bwdist(ridgeMask_full);          % distance [px] to *entire* ridge
+        
+        prof = nan(1,nBins);
+        for jj = 1:nBins
             annulus = Rmap>=radBins(jj) & Rmap<radBins(jj+1);
-            if ~any(annulus(:)), continue, end
-            prof(jj)= mean(deltaT(annulus),'omitnan');
+            if any(annulus(:))
+                prof(jj) = mean(deltaT_full(annulus),'omitnan');
+            end
         end
-        Bstack = [Bstack; prof];   %#ok<AGROW>
+        if all(isnan(prof)), continue, end      % <-- keep guard
+        Bstack = [Bstack; prof];                %#ok<AGROW>
 
-        % d) ---- intermediate plots ----------------------------------
+
+        % --- optional postage-stamp ------------------------------------
+        if doPostageStamp
+            H = stampHalfSize_px;  S = 2*H+1;
+            rowL = max(cy-H,1); rowR = min(cy+H,Ny_full);
+            colL = max(cx-H,1); colR = min(cx+H,Nx_full);
+
+            stampSq  = NaN(S,S,'like',deltaT_full);
+            rowDst   = 1 + (rowL-(cy-H));
+            colDst   = 1 + (colL-(cx-H));
+            stampSq(rowDst:rowDst+(rowR-rowL), ...
+                    colDst:colDst+(colR-colL)) = ...
+                    deltaT_full(rowL:rowR,colL:colR);
+
+            StackStamp(:,:,end+1) = stampSq;            %#ok<AGROW>
+            StampCtrXY(end+1,:)   = [cx cy];            %#ok<AGROW>
+
+            if doAzimAvg
+                prof_stamp = azimProfile(stampSq,H+1,H+1,radBins);
+                if all(isnan(prof_stamp)),  continue,  end    % <-- guard
+                StampRadProf = [StampRadProf; prof_stamp]; %#ok<AGROW>
+            end
+        end
+
+        % --- quick-look panels -----------------------------------------
         if showQuicklooks
             subplot(2,2,2); hold on
             axis ij; 
-            %set(gca,'YDir','normal'); 
-            %imagesc(wav_r,'AlphaData',maskROI); 
-            imagesc(imresize(data_full,invshrinkfactor))
-            axis image off
+            imagesc(imresize(data_full,invshrinkfactor)); axis image off
             contour(wav_r,[posLevel posLevel],'r','LineWidth',.7);
-            plot(col_sh,row_sh,'r+','MarkerSize',8,'LineWidth',1.3);
-            xlim([xR_sh(1) xR_sh(end)])
-            ylim([yR_sh(1) yR_sh(end)]) 
-             
-            title('CWT real part + mask');
+            [pY,pX] = find(ridgeMask);
+            plot(pX,pY,'r.', 'MarkerSize',4);
+            xlim([xR_sh(1) xR_sh(end)]);
+            ylim([yR_sh(1) yR_sh(end)]);
+            title('CWT real + ridge');
 
-            %subplot(2,2,3); imagesc(subROI_full); axis image off; colormap gray
-            %rectangle('Position',[cx-3 cy-3 6 6],'EdgeColor','y','LineWidth',1.2);
             subplot(2,2,3);
-            imagesc(data_full); % Plot the ENTIRE full-resolution image
-            axis image off;
-            colormap gray; 
-            % Now, set the axis limits to zoom into the ROI
-            xlim([xR_full(1), xR_full(end)]);
-            ylim([yR_full(1), yR_full(end)]);
-            title('Full-res brightness & point');
+            imagesc(data_full); axis image off; colormap gray
+            xlim([xR_full(1) xR_full(end)]);
+            ylim([yR_full(1) yR_full(end)]);
+            title('Full-res & anchor');
 
             subplot(2,2,4);
             rPlot = (radBins(1:end-1)+radBins(2:end))/2;
-            plot(rPlot,prof,'-o'); xlabel('r [px]'); ylabel('\DeltaT');
+            plot(rPlot,prof,'-o'); grid on
+            xlabel('r [px]'); ylabel('\DeltaT');
             title('Brightness-decay');
         end
-    end % kk peaks
 
-    if showQuicklooks && ~saveQuicklooks
-        drawnow
-    elseif showQuicklooks && saveQuicklooks
-        qlName = fullfile(singleOutDir, ...
-                 sprintf('ROI%02d_quicklook_%s.png',iROI,datestr(thisTime,'yyyymmdd_HHMMSS')));
-        exportgraphics(figQL,qlName,'Resolution',250); close(figQL)
-    end
-end % iROI loop
+        % save or show quick-look
+        if showQuicklooks
+            if saveQuicklooks
+                qlName = fullfile(singleOutDir, ...
+                         sprintf('ROI%02d_quicklook_%s.png', iROI, ...
+                         datestr(thisTime,'yyyymmdd_HHMMSS')));
+                exportgraphics(figQL, qlName, 'Resolution',250);
+                close(figQL)
+            else
+                drawnow
+            end
+        end
 
-% ---------- 6.1.1) COMPOSITE BRIGHTNESS-DECAY ----------------------------
+    end % while blobs
+
+end % iROI
+
+% ---------- 6.1.1) COMPOSITE BRIGHTNESS-DECAY ---------------------------
 if ~isempty(Bstack)
-    Bcomp = nanmean(Bstack,1);      % simple mean over all peaks
-    figure('Name','Composite brightness-decay',...
+    Bcomp = nanmean(Bstack,1);
+    figure('Name','Composite brightness-decay', ...
            'Units','normalized','Position',[.45 .3 .25 .4]);
     rPlot = (radBins(1:end-1)+radBins(2:end))/2;
     plot(rPlot,Bcomp,'LineWidth',2); grid on
     xlabel('Radius r [original pixels]');
     ylabel('\langle\DeltaT\rangle');
-    title(sprintf('Composite B–decay over %d lobes',size(Bstack,1)));
+    title(sprintf('Composite B-decay over %d lobes', size(Bstack,1)));
 end
 
 
+%% 6.2  POSTAGE-STAMP STACKING ________________________
+
+if doPostageStamp && ~isempty(StackStamp)
+    H = stampHalfSize_px;        % shorthand
+    N = size(StackStamp,3);
+
+    StampMean = nanmean(StackStamp,3);
+    StampStd  =  nanstd(StackStamp,0,3);
+
+    % -- quick-look --
+    figure('Name','Postage-stamp composite')
+    subplot(1,2,1); imagesc(StampMean); axis image off
+    title(sprintf('\\DeltaT mean of %d stamps',N));
+    colormap(parula)
+    subplot(1,2,2); imagesc(StampStd); axis image off
+    title(sprintf('\\DeltaT std-dev'));
+    drawnow
+
+    % -- optional composite radial profile (B2) --
+    if doAzimAvg && ~isempty(StampRadProf)
+        figure('Name','Composite B(r) from stamps')
+        rPlot = (radBins(1:end-1)+radBins(2:end))/2;
+        plot(rPlot, nanmean(StampRadProf,1),'LineWidth',2); grid on
+        xlabel('r [px]'); ylabel('\langle\DeltaT\rangle');
+        title(sprintf('Mean of %d stamps',N));
+    end
+
+    % -- NetCDF export ------------------------------------------
+    if saveStampNetCDF
+        outNC = makeParallelName(singleOutDir,'.brightsnaps');
+        if exist(outNC,'file'); delete(outNC); end
+
+        nccreate(outNC,'STAMP_MEAN','Datatype','single', ...
+                           'Dimensions',{'y',2*H+1,'x',2*H+1});
+        ncwrite (outNC,'STAMP_MEAN',single(StampMean));
+
+        nccreate(outNC,'STAMP_STD', 'Datatype','single', ...
+                           'Dimensions',{'y',2*H+1,'x',2*H+1});
+        ncwrite (outNC,'STAMP_STD', single(StampStd));
+
+        % optional – save the stack itself (big!)
+        % nccreate(outNC,'STAMP_STACK','Datatype','single', ...
+        %     'Dimensions',{'y',2*H+1,'x',2*H+1,'k',N});
+        % ncwrite (outNC,'STAMP_STACK',single(StackStamp));
+
+        ncwriteatt(outNC,'/','description', ...
+            'Postage-stamp stack around Brightness Points - mean & std');
+        ncwriteatt(outNC,'/','n_stamps',int32(N));
+        fprintf('   ↳ wrote POSTAGE-STAMP composites → %s\n',outNC);
+    end
+end
 
 %% HELPER FUNCTIONS
 %==========================================================================
@@ -1609,8 +1818,6 @@ for iR = 1:nROI
     roiSpeedCell_final{iR} = correctedWave;
 end
 end
-
-%==========================================================================
 
 %==========================================================================
 
@@ -2449,7 +2656,6 @@ angles = [theta, phi]; % [degrees] zenith, azimuth
 projection = [phi_x,phi_y]; % [degrees] x-z plane, y-z plane
 end
 
-
 function createVideoFromFrames( ...
     fNames, fTimes, dataDir, varName, ...
     outputVideoFile, frameRate, ...
@@ -2547,12 +2753,23 @@ for f_idx = 1:numFrames
         Xm = (X - mean(X(:))) * DX;
         Ym = (Y - mean(Y(:))) * DX * -1;  % invert if y down
 
-        k     = (2 * pi / wavelength) * cosd(direction);
-        l     = (2 * pi / wavelength) * sind(direction);
+        % --- meteo → math angle conversion (0° = Est, trigonometrical direction) ---
+        theta = deg2rad(90 - direction);    % direction given in meteorological convention
+        
+        % --- wave vector ---
+        k = (2*pi / wavelength) * cos(theta);   % kx
+        l = (2*pi / wavelength) * sin(theta);   % ky  (kept for phase)
         omega = cphase * (2 * pi / wavelength);
 
         t = (f_idx - 1) * time_resolution;  % e.g. in seconds
         phase = k * Xm + l * Ym - omega * t;
+        
+        % k     = (2 * pi / wavelength) * cosd(direction);
+        % l     = (2 * pi / wavelength) * sind(direction);
+        % omega = cphase * (2 * pi / wavelength);
+        % 
+        % t = (f_idx - 1) * time_resolution;  % e.g. in seconds
+        % phase = k * Xm + l * Ym - omega * t;
 
         dz = zamplitude * sin(phase);
 
@@ -2561,10 +2778,17 @@ for f_idx = 1:numFrames
                         + ((Ym - packet_center_y) / packet_width_y).^2) );
         dz = dz .* Ampwindow;
 
+        % --- horizontal displacement associayted to w' ---
+        dxy = (zamplitude / PBLdepth) * wavelength .* ...
+               sin(phase - pi/2) ./ DX;          % scalar amplitude in px
+        dx  = dxy .* cos(theta).* Ampwindow;                 % composante O-E  (columns)
+        dy  = dxy .* sin(theta).* Ampwindow;                 % composante S-N  (lines)
+
+
         % Horizontal displacement
-        dxy = (zamplitude / PBLdepth) * wavelength * sin(phase - pi/2) / DX;
-        dx = dxy .* cosd(direction) .* Ampwindow;
-        dy = dxy .* sind(direction) .* Ampwindow;
+        % dxy = (zamplitude / PBLdepth) * wavelength * sin(phase - pi/2) / DX;
+        % dx = dxy .* cosd(direction) .* Ampwindow;
+        % dy = dxy .* sind(direction) .* Ampwindow;
 
         XI = X - dx;
         YI = Y - dy;
@@ -2648,5 +2872,42 @@ catch closeME
 end
 end
 
+function newName = makeParallelName(origFullPath, tag)
+%   /path/IR_20231011_1400.nc  + '.spectralpeaks'  -->
+%   /path/IR_20231011_1400.spectralpeaks.nc
+[pathstr,base,~] = fileparts(origFullPath);
+newName = fullfile(pathstr,[base tag '.nc']);
+end
 
-%==========================================================================
+%------------------------------------------------------------------
+function prof = azimProfile(img, cx, cy, radBins)
+% AZIMPROFILE Returns the average radial profile ⟨img⟩(r)
+%
+% prof = azimProfile(img, cx, cy, radBins)
+%
+% img: 2-D image (NaN allowed)
+% cx, cy: center (columns, rows) in pixels
+% radBins: ring bounds [nBins+1 x 1]
+%
+% prof: vector 1×nBins containing azimuth average
+%
+% Notes
+% -----
+% - Ignores NaN with mean(...,'omitnan')
+% - Handles cases where no pixel is present in the ring
+
+    [Ny, Nx] = size(img);
+    [X, Y]   = meshgrid(1:Nx, 1:Ny);
+    R        = hypot(X - cx, Y - cy);
+    
+
+    nBins = numel(radBins)-1;
+    prof  = NaN(1, nBins);
+
+    for k = 1:nBins
+        mask = (R >= radBins(k)) & (R < radBins(k+1));
+        if any(mask(:))
+            prof(k) = mean(img(mask), 'omitnan');
+        end
+    end
+end
