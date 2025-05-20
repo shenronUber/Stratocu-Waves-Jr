@@ -835,7 +835,12 @@ close(figPeak);
 fprintf('Saved peak-overlay to: %s\n', peakFileName);
 
 % --- NetCDF export --------------------------------
-outNC = makeParallelName(singleOutDir, '.spectralpeaks');
+fname = sprintf('%s_spectralpeaks_%s_to_%s.nc', ...
+                upper(instrument), ...
+                datestr(startDate,'yyyymmddHHMM'), ...
+                datestr(endDate,  'yyyymmddHHMM'));
+outNC = fullfile(singleOutDir, fname);
+
 if exist(outNC,'file'), delete(outNC); end
 
 nccreate(outNC,'REAL_SUM', 'Datatype','single', ...
@@ -843,7 +848,13 @@ nccreate(outNC,'REAL_SUM', 'Datatype','single', ...
 ncwrite (outNC,'REAL_SUM', single(realSum2D));
 
 ncwriteatt(outNC,'/','instrument' ,instrument);
-ncwriteatt(outNC,'/','frameUTC'   ,char(thisTime));
+
+ncwriteatt(outNC,'/','time_coverage_start', char(startDate));
+ncwriteatt(outNC,'/','time_coverage_end',   char(endDate));
+
+ncwriteatt(outNC,'/','n_scales', int32(NSCALES));
+ncwriteatt(outNC,'/','n_angles', int32(NANGLES));
+
 ncwriteatt(outNC,'/','description', ...
    'Accumulated real part of selected CWT peaks');
 fprintf('   ↳ wrote REAL_SUM → %s\n', outNC);
@@ -1129,7 +1140,11 @@ if doPostageStamp && ~isempty(StackStamp)
 
     % -- NetCDF export ------------------------------------------
     if saveStampNetCDF
-        outNC = makeParallelName(singleOutDir,'.brightsnaps');
+        fname = sprintf('%s_brightsnaps_%s_to_%s.nc', ...
+                        upper(instrument), ...
+                        datestr(startDate,'yyyymmddHHMM'), ...
+                        datestr(endDate,  'yyyymmddHHMM'));
+        outNC = fullfile(singleOutDir, fname);
         if exist(outNC,'file'); delete(outNC); end
 
         nccreate(outNC,'STAMP_MEAN','Datatype','single', ...
@@ -1147,6 +1162,10 @@ if doPostageStamp && ~isempty(StackStamp)
 
         ncwriteatt(outNC,'/','description', ...
             'Postage-stamp stack around Brightness Points - mean & std');
+
+        ncwriteatt(outNC,'/','time_coverage_start', char(startDate));
+        ncwriteatt(outNC,'/','time_coverage_end',   char(endDate));
+        
         ncwriteatt(outNC,'/','n_stamps',int32(N));
         fprintf('   ↳ wrote POSTAGE-STAMP composites → %s\n',outNC);
     end
