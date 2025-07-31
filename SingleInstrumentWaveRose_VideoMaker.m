@@ -375,6 +375,9 @@ dateTag   = sprintf('%s_to_%s', ...
 filteredDir = fullfile(rootSepacDir,'FILTERED');
 if ~exist(filteredDir,'dir');  mkdir(filteredDir);  end
 
+valueAddedDir = fullfile(rootSepacDir, 'VALUE_ADDED_DATA');
+if ~exist(valueAddedDir,'dir'); mkdir(valueAddedDir); end
+
 outVid = fullfile(singleOutDir, ...
           sprintf('%s_annot_video_%s.mp4', upper(instrument), dateTag));
 vw = VideoWriter(outVid,'MPEG-4');
@@ -427,6 +430,13 @@ for f_idx = 1:numFrames
     %% 7-A  read & preprocess exactly like §3  --------------------------
     thisFullPath = fullfile(dataDir, fNames{f_idx});
     data = double( ncread(thisFullPath, varName) );
+
+    try
+        lat_full = ncread(thisFullPath, 'latitude');
+        lon_full = ncread(thisFullPath, 'longitude');
+    catch ME
+        error('Could not read latitude/longitude from source file: %s. Ensure input files are georeferenced.', thisFullPath);
+    end
 
     % ---- On the first frame, store base_frame & possibly precompute synthetic-wave grids ----
     if f_idx == 1
@@ -634,20 +644,90 @@ for f_idx = 1:numFrames
         troughFrame = troughFrame | trough;
              
     end
-    %% 7-D  write per-frame NetCDF  (Nx × Ny × nROI) -------------------
-    ncOut = fullfile(filteredDir, ...
-            sprintf('%s_%s.filtered.nc', instrument,frameDateStr));
-    if exist(ncOut,'file'); delete(ncOut); end
+   %% 7-D) CREATE AND WRITE THE VALUE-ADDED, CF-COMPLIANT NETCDF
+    % This new section creates a single file per timestamp containing the
+    % preprocessed image and all the filtered peak layers, along with
+    % CF-compliant coordinate variables.
 
+    % --- Define output filename for the value-added product ---
+    va_ncOut = fullfile(valueAddedDir, ...
+            sprintf('%s_value_added_%s.nc', instrument, frameDateStr));
+    if exist(va_ncOut,'file'); delete(va_ncOut); end
+
+    fprintf('   ↳ Creating value-added file: %s\n', va_ncOut);
+
+    % --- Get full-resolution dimensions ---
+    % Read the coordinate vectors from the source file
+    lat_vec = ncread(thisFullPath, 'latitude');
+    lon_vec = ncread(thisFullPath, 'longitude');
+    
+    % Get their lengths to define the dimensions correctly
+    Ny_full = length(lat_vec);
+    Nx_full = length(lon_vec);
+    nROI = size(FstackFull, 3);
+
+    % --- Get full-resolution background image data ---
     if shrinkfactor ~= 1
-    nccreate(ncOut,'FILTERED', 'Datatype','single', ...
-                     'Dimensions',{'y',(Nx2*shrinkfactor)-1,'x',Ny2*shrinkfactor,'roi',nROI});
+        bg_image_full = imresize(data_pre, shrinkfactor, 'bilinear');
+        % Ensure final size matches the coordinate vectors exactly
+        bg_image_full = bg_image_full(1:Ny_full, 1:Nx_full);
     else
-    nccreate(ncOut,'FILTERED', 'Datatype','single', ...
-                     'Dimensions',{'y',Nx2,'x',Ny2,'roi',nROI});     
+        bg_image_full = data_pre;
     end
+    
+    % --- Create Dimensions ---
+    nccreate(va_ncOut, 'latitude',  'Dimensions', {'latitude',  Ny_full}, 'Datatype', 'single');
+    nccreate(va_ncOut, 'longitude', 'Dimensions', {'longitude', Nx_full}, 'Datatype', 'single');
+    nccreate(va_ncOut, 'time',      'Dimensions', {'time', 1},           'Datatype', 'double');
+    nccreate(va_ncOut, 'roi',       'Dimensions', {'roi', nROI},         'Datatype', 'int32');
 
-    ncwrite (ncOut,'FILTERED',FstackFull);
+    % --- Create Variables ---
+    % Pre-processed background image
+    nccreate(va_ncOut, 'preprocessed_image', 'Dimensions', {'latitude', 'longitude', 'time'}, 'Datatype', 'single', 'FillValue', NaN);
+    % Stack of filtered peak data
+    nccreate(va_ncOut, 'filtered_peaks', 'Dimensions', {'latitude', 'longitude', 'roi', 'time'}, 'Datatype', 'single', 'FillValue', NaN);
+    
+    % --- Write Data to Variables ---
+    ncwrite(va_ncOut, 'latitude',  lat_vec);
+    ncwrite(va_ncOut, 'longitude', lon_vec);
+    ncwrite(va_ncOut, 'time',      posixtime(thisTime)); % POSIX time is CF-compliant
+    ncwrite(va_ncOut, 'roi',       1:nROI);
+    
+    ncwrite(va_ncOut, 'preprocessed_image', bg_image_full);
+    ncwrite(va_ncOut, 'filtered_peaks',     FstackFull);
+
+    % --- Write CF-Compliant Attributes ---
+    % Coordinates
+    ncwriteatt(va_ncOut, 'latitude',  'units', 'degrees_north');
+    ncwriteatt(va_ncOut, 'latitude',  'standard_name', 'latitude');
+    ncwriteatt(va_ncOut, 'latitude',  'long_name', 'Latitude');
+    
+    ncwriteatt(va_ncOut, 'longitude', 'units', 'degrees_east');
+    ncwriteatt(va_ncOut, 'longitude', 'standard_name', 'longitude');
+    ncwriteatt(va_ncOut, 'longitude', 'long_name', 'Longitude');
+
+    ncwriteatt(va_ncOut, 'time',      'units', 'seconds since 1970-01-01 00:00:00');
+    ncwriteatt(va_ncOut, 'time',      'standard_name', 'time');
+    ncwriteatt(va_ncOut, 'time',      'calendar', 'gregorian');
+
+    ncwriteatt(va_ncOut, 'roi',       'long_name', 'Region of Interest Index');
+    ncwriteatt(va_ncOut, 'roi',       'description', 'Index corresponding to a detected wave peak region from the Pass 1 analysis.');
+
+    % Data Variables
+    ncwriteatt(va_ncOut, 'preprocessed_image', 'long_name', 'Pre-processed satellite image');
+    ncwriteatt(va_ncOut, 'preprocessed_image', 'units', 'normalized_brightness_temperature');
+    ncwriteatt(va_ncOut, 'preprocessed_image', 'coordinates', 'latitude longitude time');
+
+    ncwriteatt(va_ncOut, 'filtered_peaks', 'long_name', 'Spatially filtered real part of wavelet coefficients for each peak');
+    ncwriteatt(va_ncOut, 'filtered_peaks', 'units', 'normalized_brightness_temperature');
+    ncwriteatt(va_ncOut, 'filtered_peaks', 'coordinates', 'latitude longitude time');
+
+    % Global Attributes
+    ncwriteatt(va_ncOut, '/', 'Conventions', 'CF-1.8');
+    ncwriteatt(va_ncOut, '/', 'title', 'Value-added gravity wave peak analysis from GOES data');
+    ncwriteatt(va_ncOut, '/', 'institution', 'Rosenstiel School, University of Miami');
+    ncwriteatt(va_ncOut, '/', 'source_file', fNames{f_idx});
+    ncwriteatt(va_ncOut, '/', 'history', sprintf('%s: Created with MATLAB Pass 2 processing script.', datestr(now)));
 
     %% 7-E  build the RGB video frame ----------------------------------
     % --- assure que data_pre et crestFrame sont de même taille -------------

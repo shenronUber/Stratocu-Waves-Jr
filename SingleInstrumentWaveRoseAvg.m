@@ -1016,35 +1016,6 @@ close(figPeak);
 
 fprintf('Saved peak-overlay to: %s\n', peakFileName);
 
-% --- NetCDF export --------------------------------
-fname = sprintf('%s_spectralpeaks_%s_to_%s.nc', ...
-                upper(instrument), ...
-                datestr(startDate,'yyyymmddHHMM'), ...
-                datestr(endDate,  'yyyymmddHHMM'));
-outNC = fullfile(singleOutDir, fname);
-
-if exist(outNC,'file'), delete(outNC); end
-
-nccreate(outNC,'REAL_SUM', 'Datatype','single', ...
-                     'Dimensions',{'y',Ny,'x',Nx});
-ncwrite (outNC,'REAL_SUM', single(realSum2D));
-
-ncwriteatt(outNC,'/','instrument' ,instrument);
-
-ncwriteatt(outNC,'/','time_coverage_start', char(startDate));
-ncwriteatt(outNC,'/','time_coverage_end',   char(endDate));
-
-ncwriteatt(outNC,'/','n_scales', int32(NSCALES));
-ncwriteatt(outNC,'/','n_angles', int32(NANGLES));
-
-ncwriteatt(outNC,'/','description', ...
-   'Accumulated real part of selected CWT peaks');
-fprintf('   ↳ wrote REAL_SUM → %s\n', outNC);
-
-% Save the perimeter masks for the video annotations
-crestPerim  = bwperim(crestMask2D);    % red outline
-troughPerim = bwperim(troughMask2D);   % blue outline
-
 % ---------- SAVE peakMask for Pass-2 -------------------------------
 peakMaskGlobal = any(peakMaskROI, 3);   % OR sur on the 3rd dimension
 
