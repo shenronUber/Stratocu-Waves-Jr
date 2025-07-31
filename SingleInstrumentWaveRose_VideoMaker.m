@@ -308,6 +308,24 @@ if useCumulativeMask
     fprintf('☑  cumulative mask created (%d×%d)\n', size(cumulativeIRmask));
 end
 
+%% Load the needed variables 
+
+% 1) recreate the same dateTag you used when you saved it
+dateTag = sprintf('%s_to_%s', ...
+    datestr(startDate,'yyyymmddHHMM'), ...
+    datestr(endDate,  'yyyymmddHHMM'));
+
+% 2) build the full path
+maskFile = fullfile(rootSepacDir,'PEAKMASK', ...
+           sprintf('%s_peakmaskROI_%s.mat', instrument, dateTag));
+
+% 3) load the variables you need
+%    — peakMaskROI  : [NSCALES × NANGLES × nROI]
+%    — Scales, Angles : your wavelet parameters
+%    — squares      : the ROI grid (shrunken coordinates)
+load(maskFile, 'peakMaskROI','Scales','Angles');
+
+
 %% Build ROI squares.
 temp=round(rowsF/shrinkfactor);
 rowsF = round(colsF/shrinkfactor);
@@ -349,23 +367,55 @@ numSquares = numel(squares);
 totalFrames = numFrames;          % For single-frame power average
 numPairs    = (numFrames - 1);    % For cross-temporal pairs
 
+fprintf('Pre-computing ROI boundaries and peak counts for metadata...\n');
+
+% Count spectral peaks per ROI
+roi_peak_count = zeros(numSquares, 1);
+for iROI = 1:numSquares
+    SA_mask = peakMaskROI(:,:,iROI);
+    CC = bwconncomp(SA_mask);
+    roi_peak_count(iROI) = CC.NumObjects;
+end
+
+% Pre-calculate ROI limits
+firstFilePath = fullfile(dataDir, fNames{1});
+lat_vec_full = ncread(firstFilePath, 'latitude');
+lon_vec_full = ncread(firstFilePath, 'longitude');
+Ny_full_ref = length(lat_vec_full);
+Nx_full_ref = length(lon_vec_full);
+
+roi_lat_min = zeros(numSquares, 1);
+roi_lat_max = zeros(numSquares, 1);
+roi_lon_min = zeros(numSquares, 1);
+roi_lon_max = zeros(numSquares, 1);
+
+for iROI = 1:numSquares
+    xShr = squares(iROI).x_range;
+    yShr = squares(iROI).y_range;
+
+    if shrinkfactor ~= 1
+        xFull_idx_start = round((xShr(1)-1)*shrinkfactor + 1);
+        xFull_idx_end   = round(xShr(end)*shrinkfactor);
+        yFull_idx_start = round((yShr(1)-1)*shrinkfactor + 1);
+        yFull_idx_end   = round(yShr(end)*shrinkfactor);
+    else
+        xFull_idx_start = xShr(1); xFull_idx_end = xShr(end);
+        yFull_idx_start = yShr(1); yFull_idx_end = yShr(end);
+    end
+    
+    xFull_idx_start = max(1, xFull_idx_start);
+    xFull_idx_end   = min(Nx_full_ref, xFull_idx_end);
+    yFull_idx_start = max(1, yFull_idx_start);
+    yFull_idx_end   = min(Ny_full_ref, yFull_idx_end);
+    
+    roi_lat_max(iROI) = lat_vec_full(yFull_idx_start);
+    roi_lat_min(iROI) = lat_vec_full(yFull_idx_end);
+    roi_lon_min(iROI) = lon_vec_full(xFull_idx_start);
+    roi_lon_max(iROI) = lon_vec_full(xFull_idx_end);
+end
+
 
 %% Running the PASS-2
-
-% 1) recreate the same dateTag you used when you saved it
-dateTag = sprintf('%s_to_%s', ...
-    datestr(startDate,'yyyymmddHHMM'), ...
-    datestr(endDate,  'yyyymmddHHMM'));
-
-% 2) build the full path
-maskFile = fullfile(rootSepacDir,'PEAKMASK', ...
-           sprintf('%s_peakmaskROI_%s.mat', instrument, dateTag));
-
-% 3) load the variables you need
-%    — peakMaskROI  : [NSCALES × NANGLES × nROI]
-%    — Scales, Angles : your wavelet parameters
-%    — squares      : the ROI grid (shrunken coordinates)
-load(maskFile, 'peakMaskROI','Scales','Angles');
 
 fprintf('\n──────────────── PASS-2  ────────────────\n');
 dateTag   = sprintf('%s_to_%s', ...
@@ -576,153 +626,113 @@ for f_idx = 1:numFrames
         Fstack(:,:,iROI) = F;
     end
 
-    %% 7-C  crest / trough outlines for the video ----------------------
-    Fstack = real(Fstack);
-
-    if shrinkfactor ~= 1
-    FstackFull = zeros([size(imresize(Fstack(:,:,1),shrinkfactor)) 30]);
-    FstackFull = FstackFull(1:end-1,:,:);
-    crestFrame  = false(size(imresize(Fstack(:,:,1),shrinkfactor)));
-    crestFrame  = crestFrame(1:end-1,:,:);
-    troughFrame = false(size(imresize(Fstack(:,:,1),shrinkfactor)));
-    troughFrame = troughFrame(1:end-1,:,:);
-    else
-    FstackFull = zeros(size(Fstack));
-    crestFrame  = false(Nx2,Ny2);
-    troughFrame = false(Nx2,Ny2);
-    end
+     %% 7-C) COMPUTE COMBINED WAVE FIELD AND VIDEO CONTOURS
+    
+    % --- Initialize a full-resolution accumulator for this frame ---
+    Ny_full = length(ncread(thisFullPath, 'latitude'));
+    Nx_full = length(ncread(thisFullPath, 'longitude'));
+    realSumFrame = zeros(Ny_full, Nx_full, 'single');
+    
+    % --- Initialize masks for the video ---
+    crestFrame  = false(Ny_full, Nx_full);
+    troughFrame = false(Ny_full, Nx_full);
 
     for iROI = 1:nROI
-        wav_real = Fstack(:,:,iROI);
+        wav_real = real(Fstack(:,:,iROI));
         
-        % Restrict the display to the current ROI only ----
-        xR       = squares(iROI).x_range;
-        yR       = squares(iROI).y_range;
-        mask = false(size(wav_real));
-        % Mettre ce print juste avant la ligne qui plante
-        % fprintf('iROI=%d: Tentative d''indexer la matrice mask (taille %dx%d) avec yR max=%d et xR max=%d\n', ...
-        % iROI, size(mask,1), size(mask,2), max(yR), max(xR));
+        mask_sh = false(size(wav_real));
+        mask_sh(squares(iROI).y_range, squares(iROI).x_range) = true;
+        wav_real(~mask_sh) = NaN;
 
-        mask(yR, xR) = true;
-
-        % fprintf('Taille du masque APRÈS indexation: %dx%d\n', size(mask,1), size(mask,2));
-
-        wav_real(~mask) = NaN;
-
-        if all(isnan(wav_real(:))) || std(wav_real(:),'omitnan') == 0   % <-- skip ROI 
-            continue
+        if all(isnan(wav_real(:))) || std(wav_real(:),'omitnan') == 0
+            continue;
         end
 
-        %=====  up-sample to full resolution  ======================
-        if shrinkfactor ~= 1
-            coeff_full  = imresize(wav_real,   shrinkfactor, 'bilinear');  % complex
-            mask_full   = imresize(mask,    shrinkfactor, 'nearest')>0;
-            coeff_full = coeff_full(1:end-1,:);
-            mask_full = mask_full(1:end-1,:);
-        else
-            coeff_full  = wav_real;   % already full-res
-            mask_full   = mask;
-        end
+        % --- Sanitize the data BEFORE resizing ---
+        % Create a copy to work with for the summation
+        wav_real_for_resize = wav_real;
+        % Replace ALL NaN values (outside the ROI) with 0.
+        % This gives imresize clean boundaries to interpolate from.
+        wav_real_for_resize(isnan(wav_real_for_resize)) = 0;
         
-        % Recaculate the level like above
-        switch lower(contourOption)
-          case 'percentile'
-            lev = prctile(abs(real(coeff_full(mask_full))), contourArray(1));
-          case '3sigma'
-            lev = std(real(coeff_full(mask_full)), 'omitnan');
-        end
-        
-        % create the two 2D masks
-        crest  = ( real(coeff_full) >=  lev ) & mask_full;
-        trough = ( real(coeff_full) <= -lev ) & mask_full;
+        % --- Upsample the sanitized data and the mask ---
+        coeff_full = imresize(wav_real_for_resize, [Ny_full, Nx_full], 'bilinear');
+        mask_full            = imresize(mask_sh, [Ny_full, Nx_full], 'nearest') > 0;
 
-        crest  = bwperim(crest);
-        trough = bwperim(trough);
+        % Add this ROI's contribution to the total. This operation is now safe from NaNs.
+        realSumFrame = realSumFrame + (coeff_full .* single(mask_full));
         
-        % Merges with the global masks
-        crestFrame  = crestFrame  | crest;
-        troughFrame = troughFrame | trough;
-             
+        % --- Calculate contours for the video (logic unchanged) ---
+        if any(mask_full(:))
+            lev = prctile(abs(coeff_full(mask_full)), contourArray(1));
+            
+            crest  = (coeff_full >= lev) & mask_full;
+            trough = (coeff_full <= -lev) & mask_full;
+            crestFrame  = crestFrame  | bwperim(crest);
+            troughFrame = troughFrame | bwperim(trough);
+        end
     end
-   %% 7-D) CREATE AND WRITE THE VALUE-ADDED, CF-COMPLIANT NETCDF
-    % This new section creates a single file per timestamp containing the
-    % preprocessed image and all the filtered peak layers, along with
-    % CF-compliant coordinate variables.
-
-    % --- Define output filename for the value-added product ---
+      
+    %% 7-D) CREATE AND WRITE THE "VALUE-ADDED" NETCDF FILE
+    
     va_ncOut = fullfile(valueAddedDir, ...
             sprintf('%s_value_added_%s.nc', instrument, frameDateStr));
     if exist(va_ncOut,'file'); delete(va_ncOut); end
-
     fprintf('   ↳ Creating value-added file: %s\n', va_ncOut);
-
-    % --- Get full-resolution dimensions ---
-    % Read the coordinate vectors from the source file
+    
     lat_vec = ncread(thisFullPath, 'latitude');
     lon_vec = ncread(thisFullPath, 'longitude');
-    
-    % Get their lengths to define the dimensions correctly
-    Ny_full = length(lat_vec);
-    Nx_full = length(lon_vec);
-    nROI = size(FstackFull, 3);
-
-    % --- Get full-resolution background image data ---
-    if shrinkfactor ~= 1
-        bg_image_full = imresize(data_pre, shrinkfactor, 'bilinear');
-        % Ensure final size matches the coordinate vectors exactly
-        bg_image_full = bg_image_full(1:Ny_full, 1:Nx_full);
-    else
-        bg_image_full = data_pre;
-    end
     
     % --- Create Dimensions ---
     nccreate(va_ncOut, 'latitude',  'Dimensions', {'latitude',  Ny_full}, 'Datatype', 'single');
     nccreate(va_ncOut, 'longitude', 'Dimensions', {'longitude', Nx_full}, 'Datatype', 'single');
-    nccreate(va_ncOut, 'time',      'Dimensions', {'time', 1},           'Datatype', 'double');
-    nccreate(va_ncOut, 'roi',       'Dimensions', {'roi', nROI},         'Datatype', 'int32');
+    nccreate(va_ncOut, 'time',      'Dimensions', {'time', 1}, 'Datatype', 'double');
+    nccreate(va_ncOut, 'roi',       'Dimensions', {'roi', numSquares}, 'Datatype', 'int32');
 
     % --- Create Variables ---
-    % Pre-processed background image
     nccreate(va_ncOut, 'preprocessed_image', 'Dimensions', {'latitude', 'longitude', 'time'}, 'Datatype', 'single', 'FillValue', NaN);
-    % Stack of filtered peak data
-    nccreate(va_ncOut, 'filtered_peaks', 'Dimensions', {'latitude', 'longitude', 'roi', 'time'}, 'Datatype', 'single', 'FillValue', NaN);
-    
-    % --- Write Data to Variables ---
+    nccreate(va_ncOut, 'wave_component_sum', 'Dimensions', {'latitude', 'longitude', 'time'}, 'Datatype', 'single', 'FillValue', 0);
+    nccreate(va_ncOut, 'roi_peak_count',     'Dimensions', {'roi'}, 'Datatype', 'int32');
+    nccreate(va_ncOut, 'roi_latitude_min',  'Dimensions', {'roi'}, 'Datatype', 'single');
+    nccreate(va_ncOut, 'roi_latitude_max',  'Dimensions', {'roi'}, 'Datatype', 'single');
+    nccreate(va_ncOut, 'roi_longitude_min', 'Dimensions', {'roi'}, 'Datatype', 'single');
+    nccreate(va_ncOut, 'roi_longitude_max', 'Dimensions', {'roi'}, 'Datatype', 'single');
+
+    % --- Write Data ---
     ncwrite(va_ncOut, 'latitude',  lat_vec);
     ncwrite(va_ncOut, 'longitude', lon_vec);
-    ncwrite(va_ncOut, 'time',      posixtime(thisTime)); % POSIX time is CF-compliant
-    ncwrite(va_ncOut, 'roi',       1:nROI);
-    
+    ncwrite(va_ncOut, 'time',      posixtime(thisTime));
+    ncwrite(va_ncOut, 'roi',       1:numSquares);
+    if shrinkfactor ~= 1
+        bg_image_full = imresize(data_pre, [Ny_full, Nx_full], 'bilinear');
+    else
+        bg_image_full = data_pre;
+    end
     ncwrite(va_ncOut, 'preprocessed_image', bg_image_full);
-    ncwrite(va_ncOut, 'filtered_peaks',     FstackFull);
+    ncwrite(va_ncOut, 'wave_component_sum', realSumFrame);
+    ncwrite(va_ncOut, 'roi_peak_count',     roi_peak_count);
+    ncwrite(va_ncOut, 'roi_latitude_min',  roi_lat_min);
+    ncwrite(va_ncOut, 'roi_latitude_max',  roi_lat_max);
+    ncwrite(va_ncOut, 'roi_longitude_min', roi_lon_min);
+    ncwrite(va_ncOut, 'roi_longitude_max', roi_lon_max);
 
-    % --- Write CF-Compliant Attributes ---
-    % Coordinates
+    % --- Write Attributes (metadata) ---
     ncwriteatt(va_ncOut, 'latitude',  'units', 'degrees_north');
     ncwriteatt(va_ncOut, 'latitude',  'standard_name', 'latitude');
-    ncwriteatt(va_ncOut, 'latitude',  'long_name', 'Latitude');
-    
     ncwriteatt(va_ncOut, 'longitude', 'units', 'degrees_east');
     ncwriteatt(va_ncOut, 'longitude', 'standard_name', 'longitude');
-    ncwriteatt(va_ncOut, 'longitude', 'long_name', 'Longitude');
-
-    ncwriteatt(va_ncOut, 'time',      'units', 'seconds since 1970-01-01 00:00:00');
-    ncwriteatt(va_ncOut, 'time',      'standard_name', 'time');
-    ncwriteatt(va_ncOut, 'time',      'calendar', 'gregorian');
-
-    ncwriteatt(va_ncOut, 'roi',       'long_name', 'Region of Interest Index');
-    ncwriteatt(va_ncOut, 'roi',       'description', 'Index corresponding to a detected wave peak region from the Pass 1 analysis.');
-
-    % Data Variables
+    ncwriteatt(va_ncOut, 'time', 'units', 'seconds since 1970-01-01 00:00:00');
+    ncwriteatt(va_ncOut, 'time', 'standard_name', 'time');
     ncwriteatt(va_ncOut, 'preprocessed_image', 'long_name', 'Pre-processed satellite image');
-    ncwriteatt(va_ncOut, 'preprocessed_image', 'units', 'normalized_brightness_temperature');
     ncwriteatt(va_ncOut, 'preprocessed_image', 'coordinates', 'latitude longitude time');
-
-    ncwriteatt(va_ncOut, 'filtered_peaks', 'long_name', 'Spatially filtered real part of wavelet coefficients for each peak');
-    ncwriteatt(va_ncOut, 'filtered_peaks', 'units', 'normalized_brightness_temperature');
-    ncwriteatt(va_ncOut, 'filtered_peaks', 'coordinates', 'latitude longitude time');
-
-    % Global Attributes
+    ncwriteatt(va_ncOut, 'wave_component_sum', 'long_name', 'Sum of real parts of wavelet coefficients for all detected wave peaks');
+    ncwriteatt(va_ncOut, 'wave_component_sum', 'coordinates', 'latitude longitude time');
+    ncwriteatt(va_ncOut, 'roi_peak_count', 'long_name', 'Number of distinct spectral peaks per ROI');
+    ncwriteatt(va_ncOut, 'roi_latitude_min', 'long_name', 'Southernmost latitude of ROI bounding box');
+    ncwriteatt(va_ncOut, 'roi_latitude_max', 'long_name', 'Northernmost latitude of ROI bounding box');
+    ncwriteatt(va_ncOut, 'roi_longitude_min', 'long_name', 'Westernmost longitude of ROI bounding box');
+    ncwriteatt(va_ncOut, 'roi_longitude_max', 'long_name', 'Easternmost longitude of ROI bounding box');
+    
     ncwriteatt(va_ncOut, '/', 'Conventions', 'CF-1.8');
     ncwriteatt(va_ncOut, '/', 'title', 'Value-added gravity wave peak analysis from GOES data');
     ncwriteatt(va_ncOut, '/', 'institution', 'Rosenstiel School, University of Miami');
