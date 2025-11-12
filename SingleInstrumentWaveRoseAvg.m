@@ -10,17 +10,24 @@
 
 %% 1) VARIABLES SETUP
 %----------- DATA-SOURCE MODE --------------------------------------------
-useCustomFolder        = false;   % false ➜ normal GOES workflow
-customFolderPath       = 'C:\Users\admin\Box\GWaves_Synthetic_G16ncfiles\closedcell';
+useCustomFolder        = true;   % false ➜ normal GOES workflow
+% CHOOSE YOUR CUSTOM DATA MODE 
+% 'sprintf'    -> Generates filenames using a pattern and indices (the original "true custom" method).
+% 'merg_style' -> Scans a folder for 'merg_YYYYMMDDHHmm_...' files (the new "mergir" option).
+customDataMode         = 'sprintf'; % <-- SET YOUR MODE HERE
+customFolderPath       = 'C:\Users\admin\Box\GWaves_Synthetic_G16ncfiles\Testcell2'; 
+% spacing between consecutive frames
+custom_t_seconds       = 1800; % 1800 for 30-min data (like 'sprintf' example)
+% Settings ONLY for 'sprintf' mode 
 customFilePattern      = 'closedcell_IR_2waves_halfhour%d.nc';   % sprintf() pattern
 customFileIndices      = 0:9;          % which “halfhourN” files to read
-customStartDate        = datetime(2024, 1, 1, 0, 0, 0);  % anchor timestamp
-custom_t_seconds       = 1800;         % spacing between consecutive frames
+customStartDate        = datetime(2704, 1, 1, 0, 0, 0);  % anchor timestamp
 
 if useCustomFolder
     startDate = customStartDate;
     endDate = customStartDate + seconds(custom_t_seconds)*length(customFileIndices);
 else
+
 %----------- DATE/TIME SETTINGS ---------------------------
 %startDate = datetime(2023, 10, 12, 1, 0, 0); % start processing time
 %endDate   = datetime(2023, 10, 12, 3, 30, 0); % end processing time
@@ -43,9 +50,10 @@ shrinkfactor = 2;             % Image is resized by this factor (2 => half the r
 invshrinkfactor = 1 / shrinkfactor;
 original_px_km = degrees_per_pixel * km_per_degree;
 
+
 %----------- WAVELET PARAMETERS -----------------------------
 Angles = 0 : pi/(7*2) : pi;           % Wavelet angles (in radians)
-Scales = [2, 4, 8, 16, 32, 64];       % Wavelet scales in pixel units
+Scales = [2, 4, 8, 16, 32, 64];      % Wavelet scales in pixel units
 Scales_orig = Scales;                 % That will anchor the Scales values in case there's a ShrinkFactor >1
 NANGLES = numel(Angles);                  % Number of angles
 NSCALES = numel(Scales);                  % Number of scales
@@ -68,7 +76,7 @@ square_size_deg = 10;        % Square size (in degrees) for ROI partitioning
 
 %----------- PREPROCESSING THRESHOLDS -----------------------
 % For IR
-IR_threshold = 277; %277;         % IR threshold: values below are set to NaN
+IR_threshold = 0 ; %274; %277;     % IR threshold: values below are set to NaN
 IR_fillPercentile = 50;     % Fill IR masked pixels with this percentile
 useCumulativeMask   = true; % If true we build one static mask
 cumulativeIRmask    = [];   % Will hold the union of clouds
@@ -127,7 +135,6 @@ upperCutoff = 16;  % Upper trusted scale
 nyquistScales= Scales_orig(:,Scales_orig<=8); % Scales that are likely to be hit by nyquist issue
 
 matrixMode = true;
-%calibrationMatrix = [0.5;0.5;0.5;0.4;0.335;0.17;0.083]; % Empirical calibration values
 calibrationMatrix = [
      2,   0.50;
      4,   0.50;
@@ -137,6 +144,16 @@ calibrationMatrix = [
     64,   0.17;
    128,   0.083;
 ];
+
+%----------- SPEED CORRECTION MODE -------------------------
+% Choose which large-scale speed limiter you want to use
+%   'classic'   -> limitSpeedByScale
+%   'azimuthal' -> limitSpeedByScale_Azimuthal
+%   'both'      -> produce both outputs; the one set in primaryCorrection
+%                  is propagated to downstream (advection + global)
+correctionMode     = 'classic';   % 'classic' | 'azimuthal' | 'both'
+primaryCorrection  = 'classic';   % only used when correctionMode = 'both'
+
 
 %----------- SYNTHETIC DATA SETTINGS ----------------------
 syntheticWaveMode = false;   % If true, superimpose a synthetic wave on a fixed base image
@@ -149,11 +166,12 @@ driftAngleDeg   = 45+90;       % e.g. 45 degrees (0 = right, 90 = up) // the ima
 
 % Parameters for the synthetic wave:
 cphase = 15;                   % Phase speed (m/s)
-wavelength = 2*150e3;            % Wavelength in meters
+wavelength = 2*150e3;          % Wavelength in meters
 direction = 235;               % Propagation from direction in degrees
 zamplitude = 100;              % Vertical amplitude (m)
 PBLdepth = 1000;               % Boundary layer depth (m)
-dB_dzPBL = 0.1;                  % dB / (dZ/PBLdepth) | Change of brightness with zamplitude
+dB_dzPBL = 0.1;                % dB / (dZ/PBLdepth) | Change of brightness with zamplitude
+T_cloud_K  = 280;              % cloud selection threshold (IR Kelvin)
 
 
 % Parameters for the spatial amplitude window (wave packet)
@@ -187,28 +205,95 @@ clevfactor_imag       = 2;         % divides contour levels (imag)
 contourOption       = 'percentile';           % 'percentile' | '3sigma'
 contourArray        = [50 60 70];             % if 'percentile'
 
-%-----------------------------------------------------------------------
+%-------------------Shrink Factor Settings Update-----------------------------------------
+
+if shrinkfactor ~= 1
+    pixel_size_km = original_px_km * shrinkfactor;
+    Scales        = Scales_orig / shrinkfactor;     % already in your code
+    scalesForAdvection = scalesForAdvection / shrinkfactor;
+else
+    pixel_size_km = original_px_km;
+end
+
+% convert thresholds/tables keyed in original pixels
+nyquistScales_post = nyquistScales / shrinkfactor;  % e.g. [2 4 8] -> [1 2 4] if s=2
+upperCutoff_post   = upperCutoff   / shrinkfactor;  % e.g. 16 -> 8
+calibrationMatrix_post = [calibrationMatrix(:,1)/shrinkfactor, calibrationMatrix(:,2)];
+assignin('base','calibrationMatrix',calibrationMatrix_post);  % if your function reads from base
 
 %% 2) RETRIEVE FILE LIST
 % Raw data is assumed to be in:
 %    <rootSepacDir>\INSTRUMENT\Data
 
 if useCustomFolder
-    % --- build the file list explicitly -------------------------------
-    dataDir   = customFolderPath;          % step around the GOES hierarchy
-    fNames    = arrayfun(@(k) sprintf(customFilePattern,k), ...
-                         customFileIndices, 'uni',0);
-    % fake but deterministic timestamps so the rest of the code works
-    fTimes    = customStartDate + seconds(custom_t_seconds) * (0:numel(fNames)-1);
+    % --- Logic for handling different custom data modes ---
+    switch lower(customDataMode)
+        case 'sprintf'
+            % The original "true custom" method
+            fprintf("Using 'sprintf' mode to generate file list.\n");
+            dataDir   = customFolderPath;
+            fNames    = arrayfun(@(k) sprintf(customFilePattern,k), customFileIndices, 'uni',0);
+            fTimes    = customStartDate + seconds(custom_t_seconds) * (0:numel(fNames)-1);
+            
+        case 'merg_style'
+            % The new method for 'merg' or AllenCell style files
+            fprintf("Using 'merg_style' mode to parse filenames.\n");
+            dataDir = customFolderPath;
+            
+            % Find all files matching the merg pattern with .nc extension
+            fileList = dir(fullfile(dataDir, 'merg_*.nc'));
+            if isempty(fileList)
+                error('No files matching ''merg_*.nc'' found in %s', dataDir);
+            end
+            
+            fNames = {fileList.name}; % Get filenames (usually sorted by OS)
+            
+            % Parse timestamps directly from the filenames
+            fTimes = NaT(1, numel(fNames)); % Pre-allocate a datetime array
+            for i = 1:numel(fNames)
+                dateStr = extractBetween(fNames{i}, '_', '_');
+                if isempty(dateStr)
+                    warning('Could not parse timestamp from filename: %s. Skipping.', fNames{i});
+                    continue; 
+                end
+                fTimes(i) = datetime(dateStr{1}, 'InputFormat', 'yyyyMMddHHmm');
+            end
+            
+            % Remove any files that failed to parse
+            validFiles = ~isnat(fTimes);
+            fNames = fNames(validFiles);
+            fTimes = fTimes(validFiles);
+            
+            % Sort files by parsed time to ensure correct order
+            [fTimes, sortIdx] = sort(fTimes);
+            fNames = fNames(sortIdx);
 
-    % try to detect the variable name only once
-    info      = ncinfo(fullfile(dataDir,fNames{1}));
-    varList   = {info.Variables.Name};
-    if  any(strcmp(varList,'CMI')), varName = 'CMI';
-    elseif any(strcmp(varList,'Rad')), varName = 'Rad';
-    else   varName = varList{1};  
+        otherwise
+            error("Unknown customDataMode: '%s'. Please choose 'sprintf' or 'merg_style'.", customDataMode);
     end
+
+    % --- Common logic for ALL custom modes ---
+    % Update the main startDate and endDate based on the files that were actually found
+    % if ~isempty(fTimes)
+    %     startDate = fTimes(1);
+    %     endDate = fTimes(end);
+    % end
+    
+    % Try to detect the variable name only once from the first valid file
+    if ~isempty(fNames)
+        info      = ncinfo(fullfile(dataDir,fNames{1}));
+        varList   = {info.Variables.Name};
+        if  any(strcmp(varList,'CMI')), varName = 'CMI';
+        elseif any(strcmp(varList,'Rad')), varName = 'Rad';
+        elseif any(strcmp(varList,'Tb')), varName = 'Tb';    
+        else   varName = varList{1};  % Fallback to the first variable
+        end
+    else
+        varName = ''; % No files found
+    end
+
 else
+    % This is the original logic for the normal GOES workflow (unchanged)
     dataDir = fullfile(rootSepacDir, upper(instrument), 'Data');
     if ~exist(dataDir, 'dir')
         error('Data directory for %s not found: %s', instrument, dataDir);
@@ -415,14 +500,6 @@ phaseExp_sum = [];
 
 prevWaveletSpec = [];  % Will store wavelet from previous frame for cross–temporal coherence
 
-if shrinkfactor ~= 1
-    pixel_size_km = original_px_km * shrinkfactor;
-    Scales = Scales / shrinkfactor;
-    scalesForAdvection = scalesForAdvection/shrinkfactor; 
-else
-    pixel_size_km = original_px_km;
-end
-
 for f_idx = 1:numFrames
     % ---- Prepare basic info about this frame ----
     thisTime = fTimes(f_idx);
@@ -499,11 +576,35 @@ for f_idx = 1:numFrames
 
         % Warp the fixed base image:
         warped_img = interp2(X, Y, base_frame, XI, YI, 'linear', 0);
+
         % Modulate brightness with the vertical displacement (dz):
-        modulated_img = warped_img .* (1 + dz / PBLdepth * dB_dzPBL);
-        
+        %modulated_img = warped_img .* (1 + dz / PBLdepth * dB_dzPBL);
         % Use the resulting image as the data for further processing:
-        data = modulated_img;
+        %data = modulated_img;
+
+        % --- Cloud-conditional brightness modulation ---
+        
+        % Sensitivity and thresholds (tune as needed)
+        S_B        = dB_dzPBL;          % slide’s S_B (same symbol you already use)
+        
+        % 1) frame-mean of the warped image
+        Bbar = mean(warped_img(:), 'omitnan');
+        
+        % 2) cloud mask (apply only to cloudy pixels)
+        cloudMask = warped_img < T_cloud_K;
+        
+        % 3) final brightness, case-wise
+        B_final = warped_img;  % default: unchanged
+        scaleTerm = S_B .* (dz ./ PBLdepth);              % S_B * Δz/H_PBL
+        B_final(cloudMask) = warped_img(cloudMask) + ...
+                             (warped_img(cloudMask) - Bbar) .* scaleTerm(cloudMask);
+        
+        % (optional) keep values in plausible IR range if your base frame is BT:
+        % B_final = max(min(B_final, 320), 180);
+        
+        % Use this for downstream processing:
+        data = B_final;
+
     end
 
     % ---- Drift shift (if enabled) ----
@@ -708,7 +809,7 @@ bgFrameIndex = numFrames;  % last frame
 thisFileName = fNames{bgFrameIndex};
 thisFullPath = fullfile(dataDir, thisFileName);
 data_bg = double(ncread(thisFullPath, varName));
-data_bg_pre = preprocessFrame(data, instrument, methodName, ...
+data_bg_pre = preprocessFrame(data_bg, instrument, methodName, ...
                 thisFullPath, thisTime, ...
                 IR_threshold, IR_fillPercentile, ...
                 VIS_lowerPercentile, VIS_upperPercentile, ...
@@ -726,44 +827,138 @@ if doWindow
 end
 
 produceOverlayWaveRose('Power', roiPowerCell, squares, num_squares_x, num_squares_y, ...
-                        Scales_orig, Angles, DisplayValuePower, data_bg_pre, singleOutDir, 'Global PowerWaveRose Overlay.png');
+                        Scales, Angles, DisplayValuePower, data_bg_pre, singleOutDir, 'Global PowerWaveRose Overlay.png');
 
 produceOverlayWaveRose('Coherence', roiCohCell, squares, num_squares_x, num_squares_y, ...
-                        Scales_orig, Angles, DisplayValueCoherence, data_bg_pre, singleOutDir, 'Global CoherenceWaveRose Overlay.png');
+                        Scales, Angles, DisplayValueCoherence, data_bg_pre, singleOutDir, 'Global CoherenceWaveRose Overlay.png');
 
 produceOverlayWaveRose('Phase', roiSpeedCell, squares, num_squares_x, num_squares_y, ...
-                        Scales_orig, Angles, DisplayValuePhase, data_bg_pre, singleOutDir, 'Global PhaseWaveRose Overlay.png');
+                        Scales, Angles, DisplayValuePhase, data_bg_pre, singleOutDir, 'Global PhaseWaveRose Overlay.png');
 
 produceOverlayWaveRose('Speed', roiSpeedCell, squares, num_squares_x, num_squares_y, ...
-                        Scales_orig, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global SpeedWaveRose Overlay.png');
+                        Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global SpeedWaveRose Overlay.png');
 
 
 %% 4C) Final Correction of Large-Scale Speeds
 
-% Apply the correction on the ROI-level wave–rose speeds
-roiSpeedCell_corrected = limitSpeedByScale(roiSpeedCell, Scales_orig, nyquistScales, upperCutoff, beta, decayFactor, decaySharpness, matrixMode);
+% --- helpers to select limiter and tags ---------------------------------
+corrfun_classic   = @limitSpeedByScale;
+corrfun_azimuthal = @limitSpeedByScale_Azimuthal;
 
-% Then, you can use produceOverlayWaveRose to visualize the final results:
-produceOverlayWaveRose('Speed Corrected', roiSpeedCell_corrected, squares, num_squares_x, num_squares_y, ...
-    Scales_orig, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global Corrected SpeedWaveRose Overlay.png');
+% Return a function handle and a text suffix given a key
+function [corrfun, tagSuffix] = pickLimiter(key, corrfun_classic, corrfun_azimuthal)
+    switch lower(key)
+        case 'classic',   corrfun = corrfun_classic;   tagSuffix = '';                % no suffix
+        case 'azimuthal', corrfun = corrfun_azimuthal; tagSuffix = ' Azimuthal';      % for titles/files
+        otherwise, error('Unknown correction key: %s', key);
+    end
+end
+%% 4C) Final Correction of Large-Scale Speeds (mode-aware)
 
-%% 4D) ADVECTION CORRECTION ON ROI-BASED ROSES
+% Prepare outputs we may fill depending on mode
+roiSpeedCell_corrected            = [];
+roiSpeedCell_corrected_Azimuthal  = [];
+roiSpeedCell_active               = [];   % the one used for downstream
+activeTagSuffix                   = '';   % affects filenames & titles
+
+switch lower(correctionMode)
+
+    case 'classic'
+        [corrfun_sel, tagSuffix] = pickLimiter('classic',   corrfun_classic, corrfun_azimuthal);
+        roiSpeedCell_corrected   = corrfun_sel(roiSpeedCell, Scales, nyquistScales_post, upperCutoff_post, ...
+                                               beta, decayFactor, decaySharpness, matrixMode);
+        roiSpeedCell_active      = roiSpeedCell_corrected;
+        activeTagSuffix          = tagSuffix;
+
+        % One overlay only (classic)
+        produceOverlayWaveRose(['Speed Corrected' tagSuffix], roiSpeedCell_corrected, squares, num_squares_x, num_squares_y, ...
+            Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, ['Global Corrected SpeedWaveRose Overlay' tagSuffix '.png']);
+
+    case 'azimuthal'
+        [corrfun_sel, tagSuffix] = pickLimiter('azimuthal', corrfun_classic, corrfun_azimuthal);
+        roiSpeedCell_corrected_Azimuthal = corrfun_sel(roiSpeedCell, Scales, nyquistScales_post, upperCutoff_post, ...
+                                                       beta, decayFactor, decaySharpness, matrixMode);
+        roiSpeedCell_active      = roiSpeedCell_corrected_Azimuthal;
+        activeTagSuffix          = tagSuffix;
+
+        % One overlay only (azimuthal)
+        produceOverlayWaveRose(['Speed Corrected' tagSuffix], roiSpeedCell_active, squares, num_squares_x, num_squares_y, ...
+            Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, ['Global Corrected SpeedWaveRose Overlay' tagSuffix '.png']);
+
+    case 'both'
+        % Produce both corrected products
+        roiSpeedCell_corrected = corrfun_classic(roiSpeedCell, Scales, nyquistScales_post, upperCutoff_post, ...
+                                                 beta, decayFactor, decaySharpness, matrixMode);
+        roiSpeedCell_corrected_Azimuthal = corrfun_azimuthal(roiSpeedCell, Scales, nyquistScales_post, upperCutoff_post, ...
+                                                             beta, decayFactor, decaySharpness, matrixMode);
+
+        produceOverlayWaveRose('Speed Corrected', roiSpeedCell_corrected, squares, num_squares_x, num_squares_y, ...
+            Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global Corrected SpeedWaveRose Overlay.png');
+
+        produceOverlayWaveRose('Speed Corrected Azimuthal', roiSpeedCell_corrected_Azimuthal, squares, num_squares_x, num_squares_y, ...
+            Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global Corrected Azimuthal SpeedWaveRose Overlay.png');
+
+        % Decide which one flows to downstream steps:
+        [corrfun_sel, activeTagSuffix] = pickLimiter(primaryCorrection, corrfun_classic, corrfun_azimuthal);
+        if strcmpi(primaryCorrection,'azimuthal')
+            roiSpeedCell_active = roiSpeedCell_corrected_Azimuthal;
+        else
+            roiSpeedCell_active = roiSpeedCell_corrected;
+        end
+
+    otherwise
+        error('Unknown correctionMode: %s', correctionMode);
+end
+
+%% 4D) ADVECTION CORRECTION ON ROI-BASED ROSES (mode-aware)
 
 if doAdvectionEstimation
-    [roiSpeedCell_corrected, roiResidCell] = ...
+    % First: un-advect the naive phase (same input as before)
+    [roiSpeedCell_unadv, roiResidCell, ~, ~]  = ...
         applyAdvectionCorrectionROI(roiSpeedCell, roiCohCell, ...
                                    Scales, Angles, ...
                                    scalesForAdvection, cohThreshold, ...
                                    pixel_size_km, time_resolution);
 
-    % Apply the correction on the ROI-level wave–rose speeds (for instance, on the advection-corrected data)
-roiSpeedCell_corrected = limitSpeedByScale(roiSpeedCell_corrected, Scales, nyquistScales, upperCutoff, beta, decayFactor, decaySharpness, matrixMode);
+    switch lower(correctionMode)
+        case 'classic'
+            [corrfun_sel, tagSuffix] = pickLimiter('classic',   corrfun_classic, corrfun_azimuthal);
+            roiSpeedCell_unadv_corr  = corrfun_sel(roiSpeedCell_unadv, Scales, nyquistScales_post, upperCutoff_post, ...
+                                                   beta, decayFactor, decaySharpness, matrixMode);
 
+            produceOverlayWaveRose(['Speed UnAdvected' tagSuffix], roiSpeedCell_unadv_corr, squares, num_squares_x, num_squares_y, ...
+                Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, ['Global UnAdvected SpeedWaveRose Overlay' tagSuffix '.png']);
 
-produceOverlayWaveRose('Speed UnAdvected', roiSpeedCell_corrected, squares, num_squares_x, num_squares_y, ...
-                        Scales_orig, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global UnAdvected SpeedWaveRose Overlay.png');
+        case 'azimuthal'
+            [corrfun_sel, tagSuffix] = pickLimiter('azimuthal', corrfun_classic, corrfun_azimuthal);
+            roiSpeedCell_unadv_corr  = corrfun_sel(roiSpeedCell_unadv, Scales, nyquistScales_post, upperCutoff_post, ...
+                                                   beta, decayFactor, decaySharpness, matrixMode);
 
+            produceOverlayWaveRose(['Speed UnAdvected' tagSuffix], roiSpeedCell_unadv_corr, squares, num_squares_x, num_squares_y, ...
+                Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, ['Global UnAdvected SpeedWaveRose Overlay' tagSuffix '.png']);
+
+        case 'both'
+            % Make both overlays, then keep the primary for any later use
+            roi_unadv_classic   = corrfun_classic(roiSpeedCell_unadv,   Scales, nyquistScales_post, upperCutoff_post, ...
+                                                  beta, decayFactor, decaySharpness, matrixMode);
+            roi_unadv_azimuthal = corrfun_azimuthal(roiSpeedCell_unadv, Scales, nyquistScales_post, upperCutoff_post, ...
+                                                    beta, decayFactor, decaySharpness, matrixMode);
+
+            produceOverlayWaveRose('Speed UnAdvected', roi_unadv_classic, squares, num_squares_x, num_squares_y, ...
+                Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global UnAdvected SpeedWaveRose Overlay.png');
+
+            produceOverlayWaveRose('Speed UnAdvected Azimuthal', roi_unadv_azimuthal, squares, num_squares_x, num_squares_y, ...
+                Scales, Angles, DisplayValueSpeed, data_bg_pre, singleOutDir, 'Global UnAdvected Azimuthal SpeedWaveRose Overlay.png');
+
+            % Promote the primary to a consistent name if you need it later:
+            if strcmpi(primaryCorrection,'azimuthal')
+                roiSpeedCell_unadv_corr = roi_unadv_azimuthal;
+            else
+                roiSpeedCell_unadv_corr = roi_unadv_classic;
+            end
+    end
 end
+
 
 %% 5) GLOBAL AVERAGE WAVE ROSES
 % Aafter Section 3, we have the following accumulators:
@@ -783,7 +978,7 @@ numPixels   = rowsF * colsF;       % total pixels per frame
 globalPower = squeeze( sum(sum(power_sum, 1, 'omitnan'), 2, 'omitnan') ) ...
               / (totalFrames * numPixels);
 % Produce the global wave–rose plot:
-produceAggregatedWaveRose('Power Global', globalPower, Scales_orig, Angles, ...
+produceAggregatedWaveRose('Power Global', globalPower, Scales, Angles, ...
     singleOutDir, 'Global PowerWaveRose', saverose, DisplayValuePower);
 
 % ----- (B) Global Coherence Wave–Rose -----
@@ -792,7 +987,7 @@ globalB1    = squeeze( sum(sum(B1_auto_sum,   1, 'omitnan'), 2, 'omitnan') );
 globalB2    = squeeze( sum(sum(B2_auto_sum,   1, 'omitnan'), 2, 'omitnan') );
 % Compute coherence (using standard formula: |S12|^2 / (S11*S22)):
 globalCoherence = ( abs(globalCross).^2 ) ./ (globalB1 .* globalB2 );
-produceAggregatedWaveRose('Coherence Global', globalCoherence, Scales_orig, Angles, ...
+produceAggregatedWaveRose('Coherence Global', globalCoherence, Scales, Angles, ...
     singleOutDir, 'Global CoherenceWaveRose', saverose, DisplayValueCoherence);
 
 % ----- (C) Global Speed (Phase) Wave–Rose -----
@@ -800,244 +995,218 @@ produceAggregatedWaveRose('Coherence Global', globalCoherence, Scales_orig, Angl
 globalPhaseExp = squeeze( sum(sum(phaseExp_sum, 1, 'omitnan'), 2, 'omitnan') );
 % Average over the number of pairs and spatial domain:
 globalAvgPhase = angle( globalPhaseExp / (numPairs * numPixels) );
-produceAggregatedWaveRose('Speed Global', globalAvgPhase, Scales_orig, Angles, ...
+produceAggregatedWaveRose('Speed Global', globalAvgPhase, Scales, Angles, ...
     singleOutDir, 'Global SpeedWaveRose', saverose, DisplayValueSpeed);
 
 % ----- (D) Global Phase Wave–Rose -----
 % For phase differences, we average the complex exponentials (for circular averaging)
-produceAggregatedWaveRose('Phase Global', globalAvgPhase, Scales_orig, Angles, ...
+produceAggregatedWaveRose('Phase Global', globalAvgPhase, Scales, Angles, ...
     singleOutDir, 'Global PhaseWaveRose', saverose, DisplayValuePhase);
 
-% ----- (E) Global Corrected Speed (Phase) Wave–Rose -----
-% Apply the correction on the global level wave–rose speeds
-globalAvgPhase_corrected = limitSpeedByScale({globalAvgPhase}, Scales_orig, nyquistScales, upperCutoff,  beta, decayFactor, decaySharpness, matrixMode);
-produceAggregatedWaveRose('Speed Corrected Global', cell2mat(globalAvgPhase_corrected), Scales_orig, Angles, ...
-    singleOutDir, 'Global Corrected SpeedWaveRose', saverose, DisplayValueSpeed);
+% ----- (E) Global Corrected Speed (Phase) Wave–Rose (mode-aware) -----
+switch lower(correctionMode)
+    case 'classic'
+        [corrfun_sel, tagSuffix] = pickLimiter('classic',   corrfun_classic, corrfun_azimuthal);
+        globalAvgPhase_corrected_cell = corrfun_sel({globalAvgPhase}, Scales, nyquistScales, upperCutoff, ...
+                                                    beta, decayFactor, decaySharpness, matrixMode);
+        globalAvgPhase_corrected = cell2mat(globalAvgPhase_corrected_cell);
+        produceAggregatedWaveRose(['Speed Corrected' tagSuffix ' Global'], globalAvgPhase_corrected, Scales, Angles, ...
+            singleOutDir, ['Global Corrected SpeedWaveRose' tagSuffix], saverose, DisplayValueSpeed);
 
-% ----- (F) Global Unadvected Speed (Phase) + Correction Wave–Rose -----
-if doAdvectionEstimation
-    [globalAvgPhase_unadvected, ResidCell] = ...
-        applyAdvectionCorrectionROI(globalAvgPhase_corrected, {globalCoherence}, ...
-                                   Scales, Angles, ...
-                                   scalesForAdvection, cohThreshold, ...
-                                   pixel_size_km, time_resolution);
+    case 'azimuthal'
+        [corrfun_sel, tagSuffix] = pickLimiter('azimuthal', corrfun_classic, corrfun_azimuthal);
+        globalAvgPhase_corrected_cell = corrfun_sel({globalAvgPhase}, Scales, nyquistScales, upperCutoff, ...
+                                                    beta, decayFactor, decaySharpness, matrixMode);
+        globalAvgPhase_corrected = cell2mat(globalAvgPhase_corrected_cell);
+        produceAggregatedWaveRose(['Speed Corrected' tagSuffix ' Global'], globalAvgPhase_corrected, Scales, Angles, ...
+            singleOutDir, ['Global Corrected SpeedWaveRose' tagSuffix], saverose, DisplayValueSpeed);
 
-    produceAggregatedWaveRose('Speed UnAdvected', cell2mat(globalAvgPhase_unadvected),Scales_orig, Angles, ...
-        singleOutDir,  'Global UnAdvected SpeedWaveRose.png', saverose, DisplayValueSpeed);
+    case 'both'
+        % Do both and then keep the primary selection for F
+        gc_classic_cell   = corrfun_classic({globalAvgPhase},   Scales, nyquistScales, upperCutoff, ...
+                                            beta, decayFactor, decaySharpness, matrixMode);
+        gc_azimuthal_cell = corrfun_azimuthal({globalAvgPhase}, Scales, nyquistScales, upperCutoff, ...
+                                              beta, decayFactor, decaySharpness, matrixMode);
+        gc_classic        = cell2mat(gc_classic_cell);
+        gc_azimuthal      = cell2mat(gc_azimuthal_cell);
 
+        produceAggregatedWaveRose('Speed Corrected Global', gc_classic, Scales, Angles, ...
+            singleOutDir, 'Global Corrected SpeedWaveRose', saverose, DisplayValueSpeed);
+        produceAggregatedWaveRose('Speed Corrected Azimuthal Global', gc_azimuthal, Scales, Angles, ...
+            singleOutDir, 'Global Corrected Azimuthal SpeedWaveRose', saverose, DisplayValueSpeed);
+
+        % Promote primary
+        if strcmpi(primaryCorrection,'azimuthal')
+            globalAvgPhase_corrected = gc_azimuthal;
+        else
+            globalAvgPhase_corrected = gc_classic;
+        end
 end
+
+% ----- (F) Global Unadvected (mode-aware) --------------------------------
+if doAdvectionEstimation
+    switch lower(correctionMode)
+
+        case {'classic','azimuthal'}
+            % Pick label/filename suffix from the active mode
+            [~, tagSuffix] = pickLimiter(correctionMode, corrfun_classic, corrfun_azimuthal);
+
+            % IMPORTANT: applyAdvectionCorrectionROI expects CELL inputs
+            [glob_unadv_cell, ~] = applyAdvectionCorrectionROI( ...
+                {globalAvgPhase_corrected}, {globalCoherence}, ...
+                Scales, Angles, ...
+                scalesForAdvection, cohThreshold, ...
+                pixel_size_km, time_resolution);
+
+            % Convert back to matrix
+            glob_unadv = cell2mat(glob_unadv_cell);
+
+            % Save with the matching tag
+            produceAggregatedWaveRose(['Speed Unadvected' tagSuffix ' Global'], ...
+                glob_unadv, Scales, Angles, ...
+                singleOutDir, ['Global Unadvected SpeedWaveRose' tagSuffix], ...
+                saverose, DisplayValueSpeed);
+
+            % If later steps need the unadvected global, keep a canonical name:
+            globalAvgPhase_unadvected = glob_unadv; %#ok<NASGU>
+
+        case 'both'
+            % Compute both corrected globals (recompute if not kept from 5E)
+            gc_classic_cell   = corrfun_classic({globalAvgPhase},   Scales, nyquistScales, upperCutoff, ...
+                                                beta, decayFactor, decaySharpness, matrixMode);
+            gc_azimuthal_cell = corrfun_azimuthal({globalAvgPhase}, Scales, nyquistScales, upperCutoff, ...
+                                                  beta, decayFactor, decaySharpness, matrixMode);
+            gc_classic   = cell2mat(gc_classic_cell);
+            gc_azimuthal = cell2mat(gc_azimuthal_cell);
+
+            % Unadvect each flavor
+            [unadv_classic_cell,  ~] = applyAdvectionCorrectionROI( ...
+                {gc_classic}, {globalCoherence}, ...
+                Scales, Angles, ...
+                scalesForAdvection, cohThreshold, ...
+                pixel_size_km, time_resolution);
+
+            [unadv_azim_cell,     ~] = applyAdvectionCorrectionROI( ...
+                {gc_azimuthal}, {globalCoherence}, ...
+                Scales, Angles, ...
+                scalesForAdvection, cohThreshold, ...
+                pixel_size_km, time_resolution);
+
+            unadv_classic = cell2mat(unadv_classic_cell);
+            unadv_azim    = cell2mat(unadv_azim_cell);
+
+            % Save both
+            produceAggregatedWaveRose('Speed Unadvected Global', ...
+                unadv_classic, Scales, Angles, ...
+                singleOutDir, 'Global Unadvected SpeedWaveRose', ...
+                saverose, DisplayValueSpeed);
+
+            produceAggregatedWaveRose('Speed Unadvected Azimuthal Global', ...
+                unadv_azim, Scales, Angles, ...
+                singleOutDir, 'Global Unadvected Azimuthal SpeedWaveRose', ...
+                saverose, DisplayValueSpeed);
+
+            % Promote the primary selection for any later use:
+            if strcmpi(primaryCorrection,'azimuthal')
+                globalAvgPhase_unadvected = unadv_azim; %#ok<NASGU>
+            else
+                globalAvgPhase_unadvected = unadv_classic; %#ok<NASGU>
+            end
+
+        otherwise
+            error('Unknown correctionMode: %s', correctionMode);
+    end
+end
+
 
 fprintf('\nAll done. Single–frame and cross–temporal wavelet (coherence) computations complete.\n');
 
-%% 6) PEAK-OVERLAY – draw real & imaginary contours of gravity-wave peaks
-% ----------BEFORE STARTUP, BUILD ONE ANNOTATION CUBE FOR THE WHOLE FRAME ----------
-Ny = size(data_bg_pre,1);   % full-res dims (after any resize/window)
-Nx = size(data_bg_pre,2);
 
-crestMask2D  = false(Ny, Nx); % 1 = crest
-troughMask2D = false(Ny, Nx); % 1 = trough
-realSum2D     = zeros (Ny, Nx, 'single'); % signed Σ(real(coeff_full))
+%% 6) COMPUTE AND SAVE ADVECTION FIELD FOR PASS 2
 
-spec_vis = spec_full;          % size = Ny × Nx × NSCALES × NANGLES
+fprintf('\n--- Computing and saving advection field for Pass 2 ---\n');
 
-% ---------- initialise global scale–angle peak mask -----------
-peakMaskROI   = false(NSCALES, NANGLES, numSquares);   % 3-D
-allBlobCount  = 0;                         % how many blobs in total
-
-% Make an empty RGB image that we can draw on
-figPeak = figure('visible','on');
-imagesc(imresize(data_bg_pre, invshrinkfactor)); axis image off; colormap(gray); hold on;
-
-% Loop over ROIs
-for iROI = 1:numSquares
-
-    % figure out this square’s grid coordinates
-    ix = mod(iROI-1, num_squares_x) + 1;        % column index (1…num_squares_x)
-    iy = floor((iROI-1) / num_squares_x) + 1;    % row    index (1…num_squares_y)
-
-    % skip all edge squares (top, bottom, left & right columns)
-    if ix == 1 || ix == num_squares_x || iy == 1 || iy == num_squares_y
-        continue;    % ← window-zone peaks won’t be detected here
-    end
-
-    % Convenience aliases
-    speedMat = roiSpeedCell_corrected{iROI};          % [NSCALES × NANGLES]
-    % For each row (corresponding to a fine-scale value), multiply by that scale.
-    for iRow = 1:size(speedMat,1)
-         speedMat(iRow, :) = (pixel_size_km*1000*(speedMat(iRow, :)/(2*pi)) .* Scales(iRow)* pi/sqrt(2))/(1800*shrinkfactor);
-    end
-    xR       = squares(iROI).x_range;
-    yR       = squares(iROI).y_range;
-
-    % Build a logical mask of peak candidates --------------------------
-    mu   = mean(speedMat(:),'omitnan');
-    sigma= std( speedMat(:),'omitnan');
-    thr  = max(4.5, mu + speed_std_factor*sigma);
-    
-    speedVals = abs(speedMat);
-
-    visited   = false(size(speedVals));
-    
-    % we will collect blobs in a struct array
-    blobList  = struct('members',{},'maxAmp',{});   
-%%
-    while true
-        % 1) find the strongest un-visited seed -----------------------------
-        speedVals(visited) = -inf;                        % mask out visited
-        [peakAmp, linearIdx] = max(speedVals(:));
-        if peakAmp < thr, break, end                    % nothing above threshold
-    
-        [sSeed,aSeed] = ind2sub(size(speedVals), linearIdx);
-    
-        % 2) flood-fill ------------------------------------------------------
-        thisBlob  = [];               % list of (s,a)
-        queue     = [sSeed, aSeed];
-    
-        while ~isempty(queue)
-            s = queue(1,1);  a = queue(1,2);
-            queue(1,:) = [];                         % pop
-            if visited(s,a), continue, end
-            visited(s,a) = true;                     % mark now
-    
-            if abs(speedMat(s,a)) < thr, continue, end
-    
-            thisBlob(end+1,:) = [s,a];               %#ok<AGROW>
-    
-            % enqueue 8-neighbours with angle wrap
-            for ds = -1:1
-                for da = -1:1
-                    if ds==0 && da==0, continue, end
-                    ss = s + ds;
-                    aa = mod(a - 1 + da, NANGLES) + 1;
-                    if ss>=1 && ss<=NSCALES && ~visited(ss,aa)
-                        queue(end+1,:) = [ss, aa];    %#ok<AGROW>
-                    end
-                end
-            end
-        end
-    
-        % 3) aggregate complex coefficients over this blob ------------------
-        wav_c_blob = zeros(round(Ny/shrinkfactor), round(Nx/shrinkfactor), 'like', spec_vis(:,:,1,1));
-        for jj = 1:size(thisBlob,1)
-            sIdx = thisBlob(jj,1);   aIdx = thisBlob(jj,2);
-            wav_c_blob = wav_c_blob + spec_vis(:,:,sIdx,aIdx);
-        end
-        wav_real = real(wav_c_blob);
-        wav_imag = imag(wav_c_blob);
-
-        %  update the 'Scale × Angle' mask of the current ROI
-        thisMask = false(NSCALES, NANGLES);
-        thisMask( sub2ind([NSCALES,NANGLES], thisBlob(:,1), thisBlob(:,2)) ) = true;
-        
-        peakMaskROI(:,:,iROI) = peakMaskROI(:,:,iROI) | thisMask;
-        allBlobCount = allBlobCount + 1;
-
-        % Optionally restrict the display to the current ROI only ----
-        mask = false(size(wav_real));
-        mask(yR, xR) = true;
-        wav_real(~mask) = NaN;
-        wav_imag(~mask) = NaN;
-
-        % Choose contour levels based on either absolute values or percentiles.
-        switch lower(contourOption)
-            case 'percentile'
-                contourLevels = prctile(abs(wav_real(:)), contourArray);
-                % Plot contours:
-                % For positive values:
-                contour(wav_real, contourLevels, 'LineColor', 'r', 'LineWidth', 0.5);
-                % For negative values (mirror the levels):
-                contour(wav_real, -contourLevels, 'LineColor', 'b', 'LineWidth', 0.5);
-            case '3sigma'
-                % Robust contour levels based on local std --------------------
-                sig_r = std(wav_real(:),'omitnan');
-                sig_i = std(wav_imag(:),'omitnan');
-        
-                posLevels =  (sig_r/clevfactor_real) : (sig_r/clevfactor_real) :  3*sig_r;
-                negLevels = -(sig_r/clevfactor_real) :-(sig_r/clevfactor_real) : -3*sig_r;
-                imagLevels=  (sig_i/clevfactor_imag) : (sig_i/clevfactor_imag) :  3*sig_i;
-        
-                %Plot: red = +real, blue = –real, green dashed = |imag| ------
-                contour(wav_real, posLevels, 'LineColor','red',  'LineWidth',0.7);
-                contour(wav_real, negLevels, 'LineColor','blue', 'LineWidth',0.7);
-                %contour(wav_imag, imagLevels,'LineColor',[0 0.6 0], ...
-                %                               'LineStyle','--','LineWidth',0.7);
-
-            otherwise
-                error('Unknown contour option. Choose either "3sigma" or "percentile".');
-        end
-
-        %=====  up-sample to full resolution  ======================
-        if shrinkfactor ~= 1
-            coeff_full  = imresize(wav_c_blob,   shrinkfactor, 'bilinear');  % complex
-            mask_full   = imresize(mask,    shrinkfactor, 'nearest')>0;
-            coeff_full = coeff_full(1:end-1,:);
-            mask_full = mask_full(1:end-1,:);
-        else
-            coeff_full  = wav_c_blob;   % already full-res
-            mask_full   = mask;
-        end
-        
-        % Recaculate the level like above
-        switch lower(contourOption)
-          case 'percentile'
-            lev = prctile(abs(real(coeff_full(mask_full))), contourArray(1));
-          case '3sigma'
-            lev = std(real(coeff_full(mask_full)), 'omitnan');
-        end
-        
-        % create the two 2D masks
-        crest  = ( real(coeff_full) >=  lev ) & mask_full;
-        trough = ( real(coeff_full) <= -lev ) & mask_full;
-        
-        % Merges with the global masks
-        crestMask2D  = crestMask2D  | crest;
-        troughMask2D = troughMask2D | trough;
-        realSum2D     = realSum2D  +  single(real(coeff_full) .* mask_full);                   
-       
-        % optional: keep a list of blobs for later ranking
-        blobList(end+1).members = thisBlob;            %#ok<AGROW>
-        blobList(end).maxAmp   = peakAmp;
-    end
-%%
-    % Draw ROI rectangle so the user knows which square is which -------
-    rectangle('Position',[xR(1), yR(1), ...
-               numel(xR), numel(yR)], ...
-               'EdgeColor','k','LineWidth',0.8);
+if ~doAdvectionEstimation
+    warning('doAdvectionEstimation is false. Cannot compute advection field. Skipping save.');
+    return;
 end
 
-% Final cosmetics & export ---------------------------------------------
-title(sprintf('Peak wavelet contours – %s', datestr(thisTime)), ...
-      'Color','w','FontWeight','bold');
+% --- Step 1: Estimate advection vector for each ROI ---
+numROIs = numel(roiSpeedCell);
+advection_U = NaN(numROIs, 1); % U-component (East-West) in m/s
+advection_V = NaN(numROIs, 1); % V-component (North-South) in m/s
+roi_center_lon = NaN(numROIs, 1);
+roi_center_lat = NaN(numROIs, 1);
 
-peakFileName = fullfile(singleOutDir, sprintf('Peaks_%s.png', ...
-                     datestr(thisTime,'yyyymmdd_HHMMSS')));
-exportgraphics(figPeak, peakFileName, 'Resolution', 300);
-close(figPeak);
+% We need the lat/lon grids to find the center coordinates of each ROI
+firstFullPath = fullfile(dataDir, fNames{1});
+lat_vec = ncread(firstFullPath, 'latitude');
+lon_vec = ncread(firstFullPath, 'longitude');
 
-fprintf('Saved peak-overlay to: %s\n', peakFileName);
+% Note: lat_vec is (Ny x 1) and lon_vec is (Nx x 1)
+% data_pre is (Ny_shrunken x Nx_shrunken)
+[Ny_full, Nx_full] = size(ncread(firstFullPath, varName)');
+[Ny_sh, Nx_sh] = size(data_bg_pre);
 
-% ---------- SAVE peakMask for Pass-2 -------------------------------
-peakMaskGlobal = any(peakMaskROI, 3);   % OR sur on the 3rd dimension
+for iROI = 1:numROIs
+    pdifrose = roiSpeedCell{iROI};
+    cohrose  = roiCohCell{iROI};
 
-peakDir = fullfile(rootSepacDir,'PEAKMASK');
-if ~exist(peakDir,'dir');  mkdir(peakDir);  end
+    % Use the existing function to get speed (u_hat) and direction (alpha_hat)
+    [u_hat, alpha_hat] = estimateAdvectionFromPhase( ...
+        pdifrose, cohrose, ...
+        Scales, Angles, ...
+        scalesForAdvection, cohThreshold, ...
+        pixel_size_km, time_resolution);
+    
+    % Convert speed and direction (radians, meteorological convention) to U, V
+    % U is positive eastward, V is positive northward
+    % alpha_hat = 0 is wind from North, pi/2 is from West. We need to convert.
+    % Standard conversion: U = u * sin(math_angle), V = u * cos(math_angle)
+    % Our alpha_hat seems to be a math angle already, let's assume so.
+    advection_U(iROI) = u_hat * cos(alpha_hat); % X-component
+    advection_V(iROI) = u_hat * sin(alpha_hat); % Y-component
+    
+    % --- Get center lat/lon for this ROI ---
+    % Get center pixel of the shrunken ROI
+    x_center_px_sh = mean(squares(iROI).x_range);
+    y_center_px_sh = mean(squares(iROI).y_range);
+    
+    % Convert to full-resolution pixel indices
+    x_center_px_full = x_center_px_sh * shrinkfactor;
+    y_center_px_full = y_center_px_sh * shrinkfactor;
+    
+    % Find the closest lat/lon from the vectors
+    % Note: MATLAB image coordinates are (row, col) which corresponds to (y, x)
+    [~, lon_idx] = min(abs( (1:Nx_full) - x_center_px_full ));
+    [~, lat_idx] = min(abs( (1:Ny_full) - y_center_px_full ));
+
+    roi_center_lon(iROI) = lon_vec(lon_idx);
+    roi_center_lat(iROI) = lat_vec(lat_idx);
+end
+
+% --- Step 2: Save the advection data to a .mat file ---
+advectionDir = fullfile(rootSepacDir, 'ADVECTION_DATA');
+if ~exist(advectionDir, 'dir'); mkdir(advectionDir); end
 
 dateTag  = sprintf('%s_to_%s', ...
            datestr(startDate,'yyyymmddHHMM'), ...
            datestr(endDate,  'yyyymmddHHMM'));
+           
+advectionFile = fullfile(advectionDir, ...
+           sprintf('%s_advection_vectors_%s.mat', instrument, dateTag));
 
-maskFile = fullfile(peakDir, ...
-           sprintf('%s_peakmaskROI_%s.mat', instrument, dateTag));
+save(advectionFile, 'advection_U', 'advection_V', ...
+                     'roi_center_lon', 'roi_center_lat', ...
+                     'startDate', 'endDate', 'instrument', '-v7.3');
 
-save(maskFile, 'peakMaskROI','peakMaskGlobal', ...
-               'Scales','Angles','numSquares','-v7');
+fprintf('☑  Advection data for %d ROIs saved to → %s\n', ...
+        numROIs, advectionFile);
 
-fprintf('☑  peakMaskROI saved (%d blobs, %d ROIs) → %s\n', ...
-        allBlobCount, numSquares, maskFile);
-
+% ---- END OF NEW SECTION ----
 
 %% HELPER FUNCTIONS
-%==========================================================================
+
 function produceOverlayWaveRose(metricLabel, roiCell, squares, num_squares_x, num_squares_y, ...
                                 Scales, Angles, DisplayValue, data_bg_pre, outDir, fileName)
 % produceOverlayWaveRose produces a figure with insets of wave–rose plots
@@ -1183,21 +1352,25 @@ function DisplayAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, axHand
     angle_edges = [Angles - d_angle/2, Angles(end) + d_angle/2];
     %angle_edges = Angles - d_angle/2;
 
+    % --- separate plotting radii from physical scales ---
+    shrinkfactor = evalin('base','shrinkfactor');           % 1 or 2, etc.
+    Scales_plot  = Scales * max(1, shrinkfactor);           % mimics old Scales_orig
+
     % Log-scale edges (midpoints between log10(Scales))
-    log_Scales = log10(Scales);
-    d_log = diff(log_Scales(1:2)); % Assumes uniform log spacing
-    log_edges = [log_Scales(1) - d_log/2, log_Scales + d_log/2];
-    
+    log_Scales = log10(Scales_plot);
+    d_log      = diff(log_Scales(1:2)); % Assumes uniform log spacing
+    log_edges  = [log_Scales(1) - d_log/2, log_Scales + d_log/2];
+
     % Create meshgrid of edges
     [Theta_edges, R_edges] = meshgrid(angle_edges, log_edges);
 
    
     if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
         pixel_size_km = evalin('base','pixel_size_km');
-        shrinkfactor = evalin('base','shrinkfactor');
-        % For each row (corresponding to a fine-scale value), multiply by that scale.
+        dt            = evalin('base','time_resolution');   % seconds
         for iRow = 1:size(innerpower,1)
-             innerpower(iRow, :) = (pixel_size_km*1000*(innerpower(iRow, :)/(2*pi)) .* Scales(iRow)* pi/sqrt(2))/(1800*shrinkfactor);
+            lambda_m = Scales(iRow) * (pixel_size_km*1000) * (pi/sqrt(2));  % wavelet λ
+            innerpower(iRow,:) = (innerpower(iRow,:)/(2*pi)) .* (lambda_m/dt); % m/s
         end
     end
     
@@ -1229,16 +1402,14 @@ function DisplayAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, axHand
     end
     
     % Optionally add radial grid lines.
-    max_scale_log = log10(max(Scales));
-    for i = 1:length(Scales)
-        level_log = log10(Scales(i));
+    max_scale_log = log10(max(Scales_plot));
+    for i = 1:length(Scales_plot)
+        level_log  = log10(Scales_plot(i));
         theta_ring = linspace(0, 2*pi, 180);
-        [x_ring, y_ring] = pol2cart(theta_ring, level_log);
-        plot(axHandle, x_ring, y_ring, 'k--', 'LineWidth',0.5);
-                val_linear = 10^(level_log);
+        [x_ring,y_ring] = pol2cart(theta_ring, level_log);
+        plot(axHandle, x_ring, y_ring, 'k--', 'LineWidth', 0.5);
         %text(axHandle, level_log, 0, sprintf('%.2f', val_linear), 'Color','k','FontSize',5,'HorizontalAlignment','left');
     end
-
     
     % Add angular lines.
     angle_ticks = linspace(0, 2*pi, 7);
@@ -1270,21 +1441,24 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
     angle_edges = [Angles - d_angle/2, Angles(end) + d_angle/2];
     %angle_edges = Angles - d_angle/2;
 
-    % Log-scale edges (midpoints between log10(Scales))
-    log_Scales = log10(Scales);
-    d_log = diff(log_Scales(1:2)); % Assumes uniform log spacing
-    log_edges = [log_Scales(1) - d_log/2, log_Scales + d_log/2];
-    
+    % geometry-only scale set for plotting
+    shrinkfactor = evalin('base','shrinkfactor');
+    Scales_plot  = Scales * max(1, shrinkfactor);
+
+    % Build edges with Scales_plot
+    log_Scales = log10(Scales_plot);
+    d_log      = diff(log_Scales(1:2));
+    log_edges  = [log_Scales(1) - d_log/2, log_Scales + d_log/2];
+
     % Create meshgrid of edges
     [Theta_edges, R_edges] = meshgrid(angle_edges, log_edges);
 
-    % --- Modification for Speed ---
     if startsWith(labelStr, 'Speed', 'IgnoreCase', true)
         pixel_size_km = evalin('base','pixel_size_km');
-        shrinkfactor = evalin('base','shrinkfactor');
-        % For each row (corresponding to a fine-scale value), multiply by that scale.
+        dt            = evalin('base','time_resolution');   % seconds
         for iRow = 1:size(innerpower,1)
-             innerpower(iRow, :) = (pixel_size_km*1000*(innerpower(iRow, :)/(2*pi)) .* Scales(iRow)* pi/sqrt(2))/(1800*shrinkfactor);
+            lambda_m = Scales(iRow) * (pixel_size_km*1000) * (pi/sqrt(2));  % wavelet λ
+            innerpower(iRow,:) = (innerpower(iRow,:)/(2*pi)) .* (lambda_m/dt); % m/s
         end
     end
 
@@ -1346,13 +1520,13 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
     plot(ax1, [x_debut, x_fin], [y_debut, y_fin], 'k-', 'LineWidth', 1.5);
     
     % Add radial grid lines (using logarithmic scale for the scales).
-    max_scale_log = log10(max(Scales));
-    for i = 1:length(Scales)
-        level_log = log10(Scales(i));
+    max_scale_log = log10(max(Scales_plot));
+    for i = 1:length(Scales_plot)
+        level_log  = log10(Scales_plot(i));
         theta_ring = linspace(0-(d_angle/2), pi+(d_angle/2), 180);
-        [x_ring, y_ring] = pol2cart(theta_ring, level_log);
-        plot(ax1, x_ring, y_ring, 'k--', 'LineWidth',0.5);
-                val_linear = 10^(level_log);
+        [x_ring,y_ring] = pol2cart(theta_ring, level_log);
+        plot(ax1, x_ring, y_ring, 'k--', 'LineWidth', 0.5);
+        val_linear = 10^(level_log);
         text(ax1, level_log, 0, sprintf('%.2f', val_linear), 'Color','k','FontSize',5,'HorizontalAlignment','left');
     end
     
@@ -1382,7 +1556,6 @@ function produceAggregatedWaveRose(labelStr, waveRoseMat, Scales, Angles, outDir
     close(figRose);
 end
 
-%==========================================================================
 function [u, alpha] = estimateAdvectionFromPhase(pdifrose, cohrose, Scales, Angles, ...
                                                  scalesForAdvection, cohThreshold, pixel_size_km, dt)
 % estimateAdvectionFromPhase estimates the advection speed (u) and direction (alpha)
@@ -1449,7 +1622,7 @@ phi_pred = zeros(nSc, nAng);
 % phi_pred(s, theta) = ((u*dt)/lambda_s) * cos(theta - alpha) * pi
 for iS = 1:nSc
     for iA = 1:nAng
-        phi_pred(iS,iA) = ((u*dt)/lambda(iS)) * cos(Angles(iA)-alpha) * pi;
+        phi_pred(iS,iA) = ((u*dt)/lambda(iS)) * cos(Angles(iA)-alpha) * (pi*2);
     end
 end
 
@@ -1460,7 +1633,7 @@ w = coh;
 err = nanmean( (w(:).*diffPhase(:)).^2 );
 end
 
-function [roiSpeedCell_corrected, roiResidCell] = applyAdvectionCorrectionROI( ...
+function [roiSpeedCell_corrected, roiResidCell, U_vectors, V_vectors] = applyAdvectionCorrectionROI( ... ...
     roiSpeedCell, roiCohCell, ...
     Scales, Angles, ...
     scalesForAdvection, cohThreshold, ...
@@ -1486,6 +1659,8 @@ function [roiSpeedCell_corrected, roiResidCell] = applyAdvectionCorrectionROI( .
 %     roiResidCell           : an alternate "residual" measure (optional)
 
     numROI = numel(roiSpeedCell);
+    U_vectors = NaN(numROI, 1);
+    V_vectors = NaN(numROI, 1);
     roiSpeedCell_corrected = cell(size(roiSpeedCell));
     roiResidCell           = cell(size(roiSpeedCell));
 
@@ -1501,9 +1676,12 @@ function [roiSpeedCell_corrected, roiResidCell] = applyAdvectionCorrectionROI( .
             scalesForAdvection, cohThreshold, ...
             pixel_size_km, dt);
 
-        % Add this line
-        fprintf('ROI %d: Estimated Advection Speed = %.2f m/s, Direction = %.1f deg\n', ...
-            iR, u_hat, rad2deg(alpha_hat));
+        % Convert speed and direction to U and V components
+        U_vectors(iR) = u_hat * cos(alpha_hat);
+        V_vectors(iR) = u_hat * sin(alpha_hat);
+
+        %fprintf('ROI %d: Estimated Advection Speed = %.2f m/s, Direction = %.1f deg\n', ...
+        %    iR, u_hat, rad2deg(alpha_hat));
 
         % 3) Build the theoretical advection phase for each scale, angle
         NSCALES  = numel(Scales);
@@ -1512,7 +1690,7 @@ function [roiSpeedCell_corrected, roiResidCell] = applyAdvectionCorrectionROI( .
         for iS = 1:NSCALES
             lambda_m = Scales(iS) * (pixel_size_km*1000) * pi/sqrt(2);  % wavelength in meters
             for iA = 1:NANGLES
-                phi_adv(iS,iA) = ((u_hat*dt)/lambda_m) * cos(Angles(iA) - alpha_hat) * pi;
+                phi_adv(iS,iA) = ((u_hat*dt)/lambda_m) * cos(Angles(iA) - alpha_hat) * 2*pi;
             end
         end
 
@@ -1534,6 +1712,258 @@ end
 
 %==========================================================================
 
+
+function roiSpeedCell_final = limitSpeedByScale_Azimuthal(roiSpeedCell_in, Scales, nyquistScales, upperCutoff, alpha, decayFactor, decaySharpness, matrixMode)
+% LIMITSPEEDBYSCALE Corrects phase wrapping (Nyquist) and smooths large scales.
+%
+%   roiSpeedCell_final = limitSpeedByScale(roiSpeedCell_in, Scales, nyquistScales, upperCutoff, alpha)
+%
+% Inputs:
+%   roiSpeedCell_in : Cell array of [NSCALES x NANGLES] phase matrices
+%   Scales          : Vector of scale values
+%   nyquistScales   : Scales to apply Nyquist correction (e.g., [1:4])
+%   upperCutoff     : Upper scale cutoff for trend smoothing
+%   alpha           : Smoothing factor for large scales [0,1]
+%
+% Output:
+%   roiSpeedCell_final : Corrected phase data
+% Version 2: Local Nyquist correction + constrained trend
+
+nROI = numel(roiSpeedCell_in);
+roiSpeedCell_final = cell(size(roiSpeedCell_in));
+phaseJumpThreshold = pi * 0.6; % More conservative threshold
+zeroPhaseThreshold = 1; % Threshold to detect near-zero phase points (radians)
+
+for iR = 1:nROI
+    currentWave = roiSpeedCell_in{iR};
+    [nScales, nAngles] = size(currentWave);
+    
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    %% Step 1: Local Nyquist Correction
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    nyquistMask = ismember(Scales, nyquistScales);    
+    correctedWave = currentWave;
+
+    % Calculate trusted profile from non-Nyquist scales
+    trustedScalesMask = ~ismember(Scales, nyquistScales);
+    trustedProfile = mean(currentWave(trustedScalesMask, :), 1);
+
+    for s = find(nyquistMask)
+         % Detect near-zero phase points
+        if ~isempty(find(abs(correctedWave(s,:)) < zeroPhaseThreshold))
+                candidates = find(abs(correctedWave(s,:)) < zeroPhaseThreshold);
+                if numel(candidates) > 1
+                    % Generation of variants
+                    variants = cell(numel(candidates), 1);
+                    scores = zeros(numel(candidates), 1);
+
+                    for c = 1:numel(candidates)
+                        variant = correctedWave(s,:);
+                        anchor = candidates(c);
+                        
+                        % Left Correction 
+                        for a = anchor-1:-1:1
+                            delta = variant(a+1) - variant(a);
+                            if abs(delta) > phaseJumpThreshold
+                                variant(a) = variant(a) + round(delta/(2*pi))*2*pi;
+                            end
+                        end
+                        
+                        % Right Correction 
+                        for a = anchor+1:nAngles
+                            delta = variant(a) - variant(a-1);
+                            if abs(delta) > phaseJumpThreshold
+                                variant(a) = variant(a) - round(delta/(2*pi))*2*pi;
+                            end
+                        end
+                        
+                        % Calculate score as RMSE from trusted profile (NEW)
+                        scores(c) = sqrt(mean((variant - trustedProfile).^2));
+                        variants{c} = variant;
+                    end
+
+                    % Select variant with smallest distance to trusted profile
+                    [~, bestIdx] = min(scores);
+                    correctedWave(s,:) = variants{bestIdx};
+
+                else
+
+                    [~, anchorIdx] = min(abs(correctedWave(s,:)));  % Finds global minimum index
+        
+                    % Correct leftward from anchor
+                    for a = (anchorIdx-1):-1:1
+                        delta = correctedWave(s,a) - correctedWave(s,a+1);
+                        if delta > pi
+                            correctedWave(s,a) = correctedWave(s,a) - 2*pi;
+                        elseif delta < -pi
+                            correctedWave(s,a) = correctedWave(s,a) + 2*pi;
+                        end
+                    end
+        
+                    % Correct rightward from anchor
+                    for a = (anchorIdx+1):nAngles
+                        delta = correctedWave(s,a) - correctedWave(s,a-1);
+                        if delta > pi
+                            correctedWave(s,a) = correctedWave(s,a) - 2*pi;
+                        elseif delta < -pi
+                            correctedWave(s,a) = correctedWave(s,a) + 2*pi;
+                        end
+                    end
+
+                end
+        else   
+            %%% cissors method %%%
+            % First pass: left → right
+            for a = 2:nAngles
+                delta = correctedWave(s,a) - correctedWave(s,a-1);
+                if abs(delta) > phaseJumpThreshold
+                    if delta > pi
+                        correctedWave(s,a) = correctedWave(s,a) - 2*pi;
+                    elseif delta < -pi
+                        correctedWave(s,a) = correctedWave(s,a) + 2*pi;
+                    end
+                end
+            end
+    
+            % second pass: right → left (compensation)
+            for a = (nAngles-1):-1:1
+                delta = correctedWave(s,a) - correctedWave(s,a+1);
+                if abs(delta) > phaseJumpThreshold
+                    if delta > pi
+                        correctedWave(s,a) = correctedWave(s,a) - 2*pi;
+                    elseif delta < -pi
+                        correctedWave(s,a) = correctedWave(s,a) + 2*pi;
+                    end
+                end
+            end
+    
+            %%% Result merging %%%
+            % Weighted Mean of the two passes 
+            correctedWave(s,:) = 0.5*(correctedWave(s,:) + flip(correctedWave(s,:)));
+        end
+    end
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Step 2: Column-wise denoising in SPEED domain, then map back to PHASE
+% Rationale:
+%   - Work in speed (m/s), not phase.
+%   - For each angle a, build a robust per-angle reference v_ref(a) from
+%     trusted small scales (e.g., 1:4 = nyquistScales).
+%   - Snap/soft-clamp small incoherent deviations toward v_ref(a).
+%   - Keep only large deviations that are locally coherent across scales
+%     and/or neighboring angles.
+%   - Finally convert speeds back to phase using the exact inverse mapping.
+
+% --- Retrieve geometry & cadence from base workspace ---------------------
+pixel_size_km = evalin('base','pixel_size_km');   % km / pixel
+dt            = evalin('base','time_resolution'); % seconds
+
+% --- Wavelength per scale (meters) following your wavelet relation -------
+lambda_m = Scales(:) * (pixel_size_km*1000) * (pi/sqrt(2));   % [nScales x 1]
+
+% --- Conversion factors: PHASE <-> SPEED ---------------------------------
+% speed [m/s] = phase * ((lambda/dt) / (2*pi))
+% phase [rad] = speed * ((2*pi) * (dt/lambda))
+scale2speed = (lambda_m./dt) ./ (2*pi);   % multiply phase by this -> speed
+speed2phase = (2*pi) .* (dt./lambda_m);   % multiply speed by this -> phase
+
+% --- Convert the current phase field to speed ----------------------------
+V = correctedWave .* scale2speed;   % V has units m/s  (nScales x nAngles)
+
+% ------------------- Denoising parameters (tune if needed) ---------------
+refMask     = ismember(Scales, nyquistScales);   % trusted small scales (e.g., 1:4)
+if ~any(refMask)
+    % Fallback: trust the first 4 scales if nyquistScales is empty
+    refMask = Scales <= min(max(Scales), 4);
+end
+
+kSigma     = 3.0;   % threshold = kSigma * MAD (robust, per angle) in m/s
+T_floor    = 0.0;   % absolute floor on threshold (m/s)
+W_scale    = 1;     % vertical neighborhood half-width (±W_scale)
+W_angle    = 1;     % angular neighborhood half-width (±W_angle)
+minSupport = 2;     % minimal number of neighbors supporting a large excursion
+snapExact  = true;  % if true: snap small deviations exactly to v_ref
+protectRef = true;  % if true: never alter trusted small scales
+
+% ----------------- Per-angle reference & noise level in SPEED ------------
+v_ref = nanmedian(V(refMask, :), 1);                                   % 1 x nAngles
+madv  = 1.4826 * nanmedian(abs(V(refMask, :) - v_ref), 1);             % 1 x nAngles (m/s)
+globalMAD = nanmedian(madv);
+madv(~isfinite(madv) | madv == 0) = max(globalMAD, eps);
+
+% --------------------------- Main denoising pass -------------------------
+[nScales, nAngles] = size(V);
+for a = 1:nAngles
+    T = max(T_floor, kSigma * madv(a));   % per-angle threshold in m/s
+    
+    for s = 1:nScales
+        if protectRef && refMask(s)
+            % Keep trusted small scales untouched (they define v_ref)
+            continue;
+        end
+        
+        v = V(s, a);
+        if ~isfinite(v), continue; end
+        
+        d  = v - v_ref(a);
+        ad = abs(d);
+        
+        if ad <= T
+            % Small, likely-noise deviation: flatten the column here
+            if snapExact
+                V(s, a) = v_ref(a);
+            else
+                % Soft shrink toward v_ref (keeps a small residual)
+                V(s, a) = v_ref(a) + sign(d) * max(0, ad - 0.5*T);
+            end
+            continue;
+        end
+        
+        % Large deviation candidate: require local coherence
+        support = 0;
+        sgn = sign(d);
+        
+        % (1) vertical support (across scales)
+        sL = max(1, s - W_scale);
+        sR = min(nScales, s + W_scale);
+        for ss = sL:sR
+            if ss == s, continue; end
+            dv = V(ss, a) - v_ref(a);
+            if isfinite(dv) && abs(dv) > T && sign(dv) == sgn
+                support = support + 1;
+            end
+        end
+        
+        % (2) horizontal support (neighboring angles)
+        aL = max(1, a - W_angle);
+        aR = min(nAngles, a + W_angle);
+        for aa = aL:aR
+            if aa == a, continue; end
+            dv = V(s, aa) - v_ref(aa);    % use that angle's own reference
+            if isfinite(dv) && abs(dv) > T && sign(dv) == sgn
+                support = support + 1;
+            end
+        end
+        
+        if support < minSupport
+            % Not coherent: clamp back to the nearest allowed value
+            V(s, a) = v_ref(a) + sgn * T;
+        else
+            % Coherent & large: keep as is (optionally: robust median over neighborhood)
+            % neighborhood = V(sL:sR, aL:aR);
+            % V(s, a) = median(neighborhood(:), 'omitnan');
+        end
+    end
+end
+
+correctedWave = V .* speed2phase;   % restore radians for downstream steps
+
+roiSpeedCell_final{iR} = correctedWave;
+end
+end
+
+
+
 function roiSpeedCell_final = limitSpeedByScale(roiSpeedCell_in, Scales, nyquistScales, upperCutoff, alpha, decayFactor, decaySharpness, matrixMode)
 % LIMITSPEEDBYSCALE Corrects phase wrapping (Nyquist) and smooths large scales.
 %
@@ -1707,183 +2137,6 @@ for iR = 1:nROI
     roiSpeedCell_final{iR} = correctedWave;
 end
 end
-
-%{
-function roiSpeedCell_final = limitSpeedByScale(roiSpeedCell_in, Scales, nyquistScales, upperCutoff, alpha, decayFactor, decaySharpness, matrixMode)
-% LIMITSPEEDBYSCALE Corrects phase wrapping (Nyquist) and smooths large scales.
-%
-%   roiSpeedCell_final = limitSpeedByScale(roiSpeedCell_in, Scales, nyquistScales, upperCutoff, alpha)
-%
-% Inputs:
-%   roiSpeedCell_in : Cell array of [NSCALES x NANGLES] phase matrices
-%   Scales          : Vector of scale values
-%   nyquistScales   : Scales to apply Nyquist correction (e.g., [1:4])
-%   upperCutoff     : Upper scale cutoff for trend smoothing
-%   alpha           : Smoothing factor for large scales [0,1]
-%
-% Output:
-%   roiSpeedCell_final : Corrected phase data
-% Version 2: Local Nyquist correction + constrained trend
-
-nROI = numel(roiSpeedCell_in);
-roiSpeedCell_final = cell(size(roiSpeedCell_in));
-phaseJumpThreshold = pi * 0.6; % More conservative threshold
-zeroPhaseThreshold = 1; % Threshold to detect near-zero phase points (radians)
-
-for iR = 1:nROI
-    currentWave = roiSpeedCell_in{iR};
-    [nScales, nAngles] = size(currentWave);
-    
-    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    %% Step 1: Local Nyquist Correction
-    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    nyquistMask = ismember(Scales, nyquistScales);    
-    correctedWave = currentWave;
-
-    % Calculate trusted profile from non-Nyquist scales
-    trustedScalesMask = ~ismember(Scales, nyquistScales);
-    trustedProfile = mean(currentWave(trustedScalesMask, :), 1);
-
-    for s = find(nyquistMask)
-         % Detect near-zero phase points
-        if ~isempty(find(abs(correctedWave(s,:)) < zeroPhaseThreshold))
-                candidates = find(abs(correctedWave(s,:)) < zeroPhaseThreshold);
-                if numel(candidates) > 1
-                    % Generation of variants
-                    variants = cell(numel(candidates), 1);
-                    scores = zeros(numel(candidates), 1);
-
-                    for c = 1:numel(candidates)
-                        variant = correctedWave(s,:);
-                        anchor = candidates(c);
-                        
-                        % Left Correction 
-                        for a = anchor-1:-1:1
-                            delta = variant(a+1) - variant(a);
-                            if abs(delta) > phaseJumpThreshold
-                                variant(a) = variant(a) + round(delta/(2*pi))*2*pi;
-                            end
-                        end
-                        
-                        % Right Correction 
-                        for a = anchor+1:nAngles
-                            delta = variant(a) - variant(a-1);
-                            if abs(delta) > phaseJumpThreshold
-                                variant(a) = variant(a) - round(delta/(2*pi))*2*pi;
-                            end
-                        end
-                        
-                        % Calculate score as RMSE from trusted profile (NEW)
-                        scores(c) = sqrt(mean((variant - trustedProfile).^2));
-                        variants{c} = variant;
-                    end
-
-                    % Select variant with smallest distance to trusted profile
-                    [~, bestIdx] = min(scores);
-                    correctedWave(s,:) = variants{bestIdx};
-
-                else
-
-                    [~, anchorIdx] = min(abs(correctedWave(s,:)));  % Finds global minimum index
-        
-                    % Correct leftward from anchor
-                    for a = (anchorIdx-1):-1:1
-                        delta = correctedWave(s,a) - correctedWave(s,a+1);
-                        if delta > pi
-                            correctedWave(s,a) = correctedWave(s,a) - 2*pi;
-                        elseif delta < -pi
-                            correctedWave(s,a) = correctedWave(s,a) + 2*pi;
-                        end
-                    end
-        
-                    % Correct rightward from anchor
-                    for a = (anchorIdx+1):nAngles
-                        delta = correctedWave(s,a) - correctedWave(s,a-1);
-                        if delta > pi
-                            correctedWave(s,a) = correctedWave(s,a) - 2*pi;
-                        elseif delta < -pi
-                            correctedWave(s,a) = correctedWave(s,a) + 2*pi;
-                        end
-                    end
-
-                end
-        else   
-            %%% cissors method %%%
-            % First pass: left → right
-            for a = 2:nAngles
-                delta = correctedWave(s,a) - correctedWave(s,a-1);
-                if abs(delta) > phaseJumpThreshold
-                    if delta > pi
-                        correctedWave(s,a) = correctedWave(s,a) - 2*pi;
-                    elseif delta < -pi
-                        correctedWave(s,a) = correctedWave(s,a) + 2*pi;
-                    end
-                end
-            end
-    
-            % second pass: right → left (compensation)
-            for a = (nAngles-1):-1:1
-                delta = correctedWave(s,a) - correctedWave(s,a+1);
-                if abs(delta) > phaseJumpThreshold
-                    if delta > pi
-                        correctedWave(s,a) = correctedWave(s,a) - 2*pi;
-                    elseif delta < -pi
-                        correctedWave(s,a) = correctedWave(s,a) + 2*pi;
-                    end
-                end
-            end
-    
-            %%% Result merging %%%
-            % Weighted Mean of the two passes 
-            correctedWave(s,:) = 0.5*(correctedWave(s,:) + flip(correctedWave(s,:)));
-        end
-    end
-
-    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    %% Step 2: Constrained Trend Smoothing
-    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-    trustedMask = (Scales > max(nyquistScales)) & (Scales <= upperCutoff);
-    %%
-    if any(trustedMask)
-        % Calculate baseline trend with scale-dependent decay
-        if matrixMode
-            baseline = zeros(nScales, nAngles);
-            % Retrieve the 'calibrationMatrix' from base workspace
-            Matrix = evalin('base','calibrationMatrix'); 
-
-            for s = 1:nScales
-                thisScale = Scales(s);
-        
-                % Interpolate factor from the user-provided table
-                factor = interp1( ...
-                    Matrix (:,1), ...  % known scale values
-                    Matrix (:,2), ...  % known factors
-                    thisScale,           ...    % the scale we have
-                    'linear', 'extrap' );
-        
-                baseline(s,:) = mean(correctedWave(trustedMask,:), 1, 'omitnan') * factor;
-            end
-
-        else
-            % Use an exponential factor
-            baseline = mean(correctedWave(trustedMask,:), 1, 'omitnan') ...
-                       .* exp(-decaySharpness * (Scales'/max(Scales))) * decayFactor;
-        end
-
-    else
-        baseline = zeros(nScales, 1);
-    end
-
-    % Apply constrained smoothing for large scales
-    for s = find(Scales > upperCutoff)'
-        correctedWave(s,:) = alpha*baseline(s,:) + (1-alpha)*correctedWave(s,:);
-    end
-
-    roiSpeedCell_final{iR} = correctedWave;
-end
-end
-%}
-%==========================================================================
 
 function results = extractWaveletFeatures(dataType, spec_full, data_background, squares, ...
     Scales, Angles, frameDateStr, ...
@@ -1989,7 +2242,6 @@ function results = extractWaveletFeatures(dataType, spec_full, data_background, 
     results.NumPeaks = numPeaks;
     results.PeakRegions = peakRegions;
 end
-%--------------------------------------------------------------------------
 
 function velocityField = calculatePIV(image1, image2, shrinkfactor)
     % Calculate PIV between two images
@@ -2023,7 +2275,6 @@ function velocityField = calculatePIV(image1, image2, shrinkfactor)
     % Combine the downsampled velocity vectors into a single matrix
     velocityField = cat(3, xtable_ds, ytable_ds, utable_ds, vtable_ds);
 end
-%--------------------------------------------------------------------------
 
 function [fileNames, fileTimestamps, variableName] = getDateRangeFiles(dataDir, startDate, endDate)
     ncFiles = dir(fullfile(dataDir, '*.nc'));
@@ -2042,6 +2293,8 @@ function [fileNames, fileTimestamps, variableName] = getDateRangeFiles(dataDir, 
         variableName = 'CMI';
     elseif any(strcmp(varList, 'Rad'))
         variableName = 'Rad';
+    elseif any(strcmp(varList, 'Tb'))
+        variableName = 'Tb';
     else
         variableName = varList{1};
         warning('No standard var found; using %s', variableName);
@@ -2078,7 +2331,6 @@ function [fileNames, fileTimestamps, variableName] = getDateRangeFiles(dataDir, 
     [fileTimestamps, idxSort] = sort(fileTimestamps);
     fileNames = fileNames(idxSort);
 end
-%--------------------------------------------------------------------------
 
 function data_preprocessed = preprocessFrame(data, dataType, methodName, fullPath, ...
     fileTime, IR_threshold, IR_fillPercentile, ...
@@ -2188,7 +2440,6 @@ function data_preprocessed = preprocessFrame(data, dataType, methodName, fullPat
                 lpWidth20, lpWidth50, lpWidth100);
     end
 end
-%--------------------------------------------------------------------------
 
 function img_processed = processDataMethod(data, methodName, clipMinHP, clipMaxHP, lpWidth20, lpWidth50, lpWidth100)
     switch lower(methodName)
@@ -2232,7 +2483,6 @@ function img_processed = processDataMethod(data, methodName, clipMinHP, clipMaxH
             error('Unknown method: %s', methodName);
     end
 end
-%--------------------------------------------------------------------------
 
 function img_out = applyHighPass(data, filterWidth, doSqrtEnhance, clipMinHP, clipMaxHP)
     lowPass = imgaussfilt(data, filterWidth);
@@ -2244,7 +2494,6 @@ function img_out = applyHighPass(data, filterWidth, doSqrtEnhance, clipMinHP, cl
     highPass(highPass > clipMaxHP) = clipMaxHP;
     img_out = standardizeData(highPass);
 end
-%--------------------------------------------------------------------------
 
 function data_win = applyRadialWindow(data_in, radius_factor, decay_rate)
     % Compute global median of the input data
@@ -2270,7 +2519,6 @@ function data_win = applyRadialWindow(data_in, radius_factor, decay_rate)
     %   - Where window = 0, output ~ median_val
     data_win = window .* data_in + (1 - window) .* median_val;
 end
-%--------------------------------------------------------------------------
 
 function data_win = applyRectangularWindow(data_in, radius_factor, decay_rate)
     % Compute global median of the input data
@@ -2295,14 +2543,12 @@ function data_win = applyRectangularWindow(data_in, radius_factor, decay_rate)
     % Blend data_in with the median (instead of fading to zero):
     data_win = window .* data_in + (1 - window) .* median_val;
 end
-%--------------------------------------------------------------------------
 
 function out = standardizeData(data)
     meanVal = mean(data(:), 'omitnan');
     stdVal  = std(data(:),  'omitnan');
     out    = (data - meanVal) ./ stdVal;
 end
-%--------------------------------------------------------------------------
 
 function out = standardizeDataNaN(data)
 
@@ -2320,7 +2566,6 @@ function out = standardizeDataNaN(data)
     data(nanMask) = min(data(~nanMask));
     out = standardizeData(data);
 end
-%--------------------------------------------------------------------------
 
 function produceAnnotatedImages(dataType, spec_full, data_background, squares, ...
     Scales, Angles, outDir, frameDateStr, ...
@@ -2543,7 +2788,6 @@ function produceAnnotatedImages(dataType, spec_full, data_background, squares, .
         close(fig);
     end
 end
-%--------------------------------------------------------------------------
 
 function renameAndOrganizeFiles(dataType, startDate, endDate, sourceRootDir, outRootDir)
     switch upper(dataType)
@@ -2598,7 +2842,6 @@ function renameAndOrganizeFiles(dataType, startDate, endDate, sourceRootDir, out
         end
     end
 end
-%--------------------------------------------------------------------------
 
 function roundedDT = roundToQuarterHour(originalDT)
     minutesFromQuarter = mod(minute(originalDT), 15);
@@ -2608,7 +2851,6 @@ function roundedDT = roundToQuarterHour(originalDT)
         roundedDT = dateshift(originalDT, 'start', 'minute') + minutes(15 - minutesFromQuarter);
     end
 end
-%--------------------------------------------------------------------------
 
 function insolation = computeInsolationGrid(datetime_val, latGrid, lonGrid, time_zone, rotation, dst)
 % COMPUTEINSOLATIONGRID_PARALLEL Computes solar insolation (W/m²) over a latitude/longitude grid
@@ -2657,7 +2899,6 @@ function insolation = computeInsolationGrid(datetime_val, latGrid, lonGrid, time
     end
 
 end
-%--------------------------------------------------------------------------
 
 function [angles,projection] = solarPosition(datetime,latitude,longitude, ...
                                              time_zone,rotation,dst)
